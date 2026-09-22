@@ -192,7 +192,7 @@ def cmd_download(args):
     try:
         print(client.recv_json())
     except Exception as e:
-        print(f"(brak/nieoczekiwana odpowiedź na Stop — normalne, plik już zapisany: {e})")
+        print(f"(No/unexpected response to Stop - normal, file will still be saved: {e})")
 
     with open(args.out, "wb") as f:
         f.write(buf)

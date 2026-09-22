@@ -14,3 +14,9 @@ venv/
 *.h264
 out/
 output/
+
+downloads/
+samples/
+test-converted_work/
+scripts/__pycache__/
+*.pyc
