@@ -35,6 +35,19 @@ what it does and why.
 
 ## Where to start
 
+Launch the desktop GUI after installing the requirements:
+
+```powershell
+python scripts/nvr_gui.py
+```
+
+The GUI reads the NVR password from the `XMEYE_PASSWORD` environment variable.
+
+![XMEye NVR Tools search results](docs/images/gui-search-results.png)
+
+See the **[desktop GUI guide](docs/GUI_GUIDE.md)** for installation, search,
+download queue, conversion, cancellation, repair, and file-retention details.
+
 - **New/unknown device?** Run `identify_nvr.py` first (port scan + login +
   device info), then `rtsp_probe.py` to find a working RTSP URL.
 - **Want periodic snapshots from archived footage** (e.g. one photo every

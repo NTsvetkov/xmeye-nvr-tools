@@ -14,7 +14,9 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, time as dt_time
 from pathlib import Path
-from typing import Iterable
+from typing import Callable, Iterable
+
+from xmeye_repair import XMEyeRecordSanitizer
 
 
 HEADER_FMT = "<BB2xII2xHI"
@@ -55,6 +57,7 @@ def read_exact(
     sock: socket.socket,
     n: int,
     overall_timeout: float = 15.0,
+    cancel_event=None,
 ) -> bytes:
     data = b""
     sock.settimeout(5.0)
@@ -62,6 +65,9 @@ def read_exact(
     last_progress = time.time()
 
     while len(data) < n:
+        if cancel_event is not None and cancel_event.is_set():
+            raise InterruptedError("Operation cancelled.")
+
         try:
             chunk = sock.recv(n - len(data))
         except (socket.timeout, TimeoutError):
@@ -98,6 +104,10 @@ class DVRIPClient:
         self.sequence = 0
 
     def close(self) -> None:
+        try:
+            self.sock.shutdown(socket.SHUT_RDWR)
+        except Exception:
+            pass
         try:
             self.sock.close()
         except Exception:
@@ -182,6 +192,8 @@ class DVRIPClient:
         channel: int,
         begin: datetime,
         end: datetime,
+        progress_callback: Callable[[int, int], None] | None = None,
+        cancel_event=None,
     ) -> list[Recording]:
         """
         Search all recordings in the requested period.
@@ -204,6 +216,9 @@ class DVRIPClient:
         page_number = 1
 
         while cursor < end:
+            if cancel_event is not None and cancel_event.is_set():
+                raise InterruptedError("Search cancelled.")
+
             self.send(
                 MSG_FILE_QUERY,
                 {
@@ -233,10 +248,13 @@ class DVRIPClient:
                 [],
             )
 
-            print(
-                f"  Search page {page_number}: "
-                f"{len(files)} recording(s)"
-            )
+            if progress_callback is None:
+                print(
+                    f"  Search page {page_number}: "
+                    f"{len(files)} recording(s)"
+                )
+            else:
+                progress_callback(page_number, len(files))
 
             if not files:
                 break
@@ -362,6 +380,9 @@ class DVRIPClient:
         channel: int,
         output_path: Path,
         timeout: float = 120.0,
+        progress_callback: Callable[[int, int, float], None] | None = None,
+        cancel_event=None,
+        record_log_callback: Callable[[str], None] | None = None,
     ) -> None:
         playback_param = {
             "PlayMode": "ByName",
@@ -428,11 +449,19 @@ class DVRIPClient:
         last_report = started
 
         with output_path.open("wb") as output_file:
+            sanitizer = XMEyeRecordSanitizer(
+                output_file,
+                record_log_callback or print,
+            )
             while True:
+                if cancel_event is not None and cancel_event.is_set():
+                    raise InterruptedError("Download cancelled.")
+
                 header_raw = read_exact(
                     self.sock,
                     HEADER_LEN,
                     overall_timeout=timeout,
+                    cancel_event=cancel_event,
                 )
 
                 (
@@ -454,9 +483,10 @@ class DVRIPClient:
                     self.sock,
                     payload_len,
                     overall_timeout=timeout,
+                    cancel_event=cancel_event,
                 )
 
-                output_file.write(payload)
+                sanitizer.feed(payload)
                 total += payload_len
 
                 now = time.time()
@@ -472,7 +502,9 @@ class DVRIPClient:
 
                     expected = recording.size_bytes
 
-                    if expected > 0:
+                    if progress_callback is not None:
+                        progress_callback(total, expected, speed)
+                    elif expected > 0:
                         percent = min(
                             total / expected * 100,
                             100.0,
@@ -498,9 +530,31 @@ class DVRIPClient:
 
                     last_report = now
 
+            sanitize_stats = sanitizer.finish()
+
+        if sanitize_stats.frame_count <= 0:
+            raise RuntimeError(
+                "Download contained no complete XMEye frame records."
+            )
+
+        if sanitize_stats.skipped_bytes:
+            message = (
+                f"Sanitized download: kept {sanitize_stats.frame_count:,} records "
+                f"({format_size(sanitize_stats.output_bytes)}), skipped "
+                f"{format_size(sanitize_stats.skipped_bytes)}."
+            )
+            if record_log_callback is not None:
+                record_log_callback(message)
+            else:
+                print(f"  {message}")
+
         elapsed = time.time() - started
 
         expected = recording.size_bytes
+
+        if progress_callback is not None:
+            speed = total / elapsed if elapsed > 0 else 0.0
+            progress_callback(total, expected, speed)
 
         # Reaching a zero-length DVRIP packet is a clean end marker
         # from the NVR. Some recordings (especially the current/latest
@@ -508,7 +562,9 @@ class DVRIPClient:
         # slightly from the number of bytes PlayByName actually sends.
         # A transport failure never reaches this point because read_exact()
         # raises first, so accept a clean EOF and merely warn on mismatch.
-        if expected > 0 and total != expected:
+        if progress_callback is not None:
+            return
+        elif expected > 0 and total != expected:
             difference = total - expected
 
             print(

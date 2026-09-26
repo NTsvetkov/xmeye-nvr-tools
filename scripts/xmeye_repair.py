@@ -2,10 +2,11 @@
 
 import argparse
 import mmap
-import shutil
 import struct
 import sys
+from dataclasses import dataclass
 from pathlib import Path
+from typing import BinaryIO, Callable
 
 
 MAGIC_PREFIX = b"\x00\x00\x01"
@@ -16,22 +17,37 @@ TYPE_IFRAME = 0xFC
 TYPE_PFRAME = 0xFD
 TYPE_SNAPSHOT = 0xFE
 
+KNOWN_MARKERS = tuple(
+    MAGIC_PREFIX + bytes((frame_type,))
+    for frame_type in (
+        TYPE_INFO,
+        TYPE_AUDIO,
+        TYPE_IFRAME,
+        TYPE_PFRAME,
+        TYPE_SNAPSHOT,
+    )
+)
+
+MAX_RECORD_BYTES = 64 * 1024 * 1024
+RESYNC_CONFIRM_RECORDS = 3
+
+
+@dataclass(frozen=True)
+class SanitizeStats:
+    input_bytes: int
+    output_bytes: int
+    frame_count: int
+    skipped_bytes: int
+    skipped_ranges: int
+
 
 def find_next_container_frame(
     data: mmap.mmap,
     start: int,
 ) -> int:
-    known_markers = (
-        b"\x00\x00\x01\xF9",
-        b"\x00\x00\x01\xFA",
-        b"\x00\x00\x01\xFC",
-        b"\x00\x00\x01\xFD",
-        b"\x00\x00\x01\xFE",
-    )
-
     candidates = []
 
-    for marker in known_markers:
+    for marker in KNOWN_MARKERS:
         pos = data.find(marker, start)
 
         if pos != -1:
@@ -154,6 +170,202 @@ def frame_end(
         f"Unknown XMEye frame type "
         f"0x{frame_type:02X} at 0x{pos:X}"
     )
+
+
+def record_size(data, pos: int = 0) -> tuple[int | None, str]:
+    """Return a complete record size, or why it cannot be returned yet."""
+    available = len(data) - pos
+    if available < 4:
+        return None, "incomplete"
+    if data[pos:pos + 3] != MAGIC_PREFIX or data[pos:pos + 4] not in KNOWN_MARKERS:
+        return None, "invalid"
+
+    frame_type = data[pos + 3]
+    header_size = 16 if frame_type in (TYPE_IFRAME, TYPE_SNAPSHOT) else 8
+    if available < header_size:
+        return None, "incomplete"
+
+    if frame_type in (TYPE_IFRAME, TYPE_SNAPSHOT):
+        payload_len = struct.unpack_from("<I", data, pos + 12)[0]
+    elif frame_type == TYPE_PFRAME:
+        payload_len = struct.unpack_from("<I", data, pos + 4)[0]
+    else:
+        payload_len = struct.unpack_from("<H", data, pos + 6)[0]
+
+    total = header_size + payload_len
+    if total > MAX_RECORD_BYTES:
+        return None, "invalid"
+    if available < total:
+        return None, "incomplete"
+    return total, "complete"
+
+
+class XMEyeRecordSanitizer:
+    """Write only complete XMEye records from an arbitrarily chunked stream."""
+
+    def __init__(
+        self,
+        output: BinaryIO,
+        log: Callable[[str], None] | None = None,
+    ) -> None:
+        self.output = output
+        self.log = log or (lambda _message: None)
+        self.buffer = bytearray()
+        self.buffer_offset = 0
+        self.input_bytes = 0
+        self.output_bytes = 0
+        self.frame_count = 0
+        self.skipped_bytes = 0
+        self.skipped_ranges = 0
+        self._gap_offset: int | None = None
+        self._gap_size = 0
+        self._gap_preview = bytearray()
+
+    def feed(self, chunk: bytes) -> None:
+        if not chunk:
+            return
+        self.buffer.extend(chunk)
+        self.input_bytes += len(chunk)
+        self._process(eof=False)
+
+    def finish(self) -> SanitizeStats:
+        self._process(eof=True)
+        if self.buffer:
+            self._discard_bad(len(self.buffer))
+        self._close_gap()
+        return SanitizeStats(
+            self.input_bytes,
+            self.output_bytes,
+            self.frame_count,
+            self.skipped_bytes,
+            self.skipped_ranges,
+        )
+
+    def _process(self, eof: bool) -> None:
+        while self.buffer:
+            size, state = record_size(self.buffer)
+            if state == "complete":
+                self._close_gap()
+                self.output.write(self.buffer[:size])
+                del self.buffer[:size]
+                self.buffer_offset += size
+                self.output_bytes += size
+                self.frame_count += 1
+                continue
+            if state == "incomplete" and not eof:
+                return
+            if state == "incomplete" and eof:
+                self._discard_bad(len(self.buffer))
+                return
+
+            candidate, pending = self._find_resync(eof)
+            if candidate is not None:
+                self._discard_bad(candidate)
+                continue
+            if pending is not None:
+                # Keep the invalid prefix in front of an unconfirmed marker.
+                # Otherwise the next feed would see that marker at offset zero
+                # and accept it as a normal record without the resync lookahead.
+                return
+            keep = 0 if eof else min(3, len(self.buffer))
+            self._discard_bad(len(self.buffer) - keep)
+            if eof:
+                return
+
+    def _find_resync(self, eof: bool) -> tuple[int | None, int | None]:
+        search = 1
+        pending: int | None = None
+        while search < len(self.buffer):
+            hits = [
+                self.buffer.find(marker, search)
+                for marker in KNOWN_MARKERS
+            ]
+            hits = [hit for hit in hits if hit >= 0]
+            if not hits:
+                break
+            candidate = min(hits)
+            verdict = self._probe_candidate(candidate, eof)
+            if verdict == "valid":
+                return candidate, None
+            if verdict == "pending":
+                pending = candidate
+                break
+            search = candidate + 1
+        return None, pending
+
+    def _probe_candidate(self, pos: int, eof: bool) -> str:
+        records = 0
+        cursor = pos
+        while records < RESYNC_CONFIRM_RECORDS:
+            size, state = record_size(self.buffer, cursor)
+            if state == "complete":
+                records += 1
+                cursor += size
+                continue
+            if state == "invalid":
+                return "invalid"
+            if eof:
+                return "valid" if records else "invalid"
+            return "pending"
+        return "valid"
+
+    def _discard_bad(self, count: int) -> None:
+        if count <= 0:
+            return
+        if self._gap_offset is None:
+            self._gap_offset = self.buffer_offset
+        take = min(16 - len(self._gap_preview), count)
+        if take > 0:
+            self._gap_preview.extend(self.buffer[:take])
+        del self.buffer[:count]
+        self.buffer_offset += count
+        self._gap_size += count
+        self.skipped_bytes += count
+
+    def _close_gap(self) -> None:
+        if self._gap_offset is None:
+            return
+        self.skipped_ranges += 1
+        preview = bytes(self._gap_preview).hex(" ")
+        self.log(
+            f"Skipped invalid data at 0x{self._gap_offset:X}: "
+            f"{self._gap_size:,} byte(s); first bytes: {preview}"
+        )
+        self._gap_offset = None
+        self._gap_size = 0
+        self._gap_preview.clear()
+
+
+def sanitize_stream(
+    source: BinaryIO,
+    target: BinaryIO,
+    log: Callable[[str], None] | None = None,
+    cancel_event=None,
+) -> SanitizeStats:
+    sanitizer = XMEyeRecordSanitizer(target, log)
+    while True:
+        if cancel_event is not None and cancel_event.is_set():
+            raise InterruptedError("Repair cancelled.")
+        chunk = source.read(1024 * 1024)
+        if not chunk:
+            break
+        sanitizer.feed(chunk)
+    return sanitizer.finish()
+
+
+def sanitize_file(
+    input_path: Path,
+    output_path: Path,
+    log: Callable[[str], None] | None = print,
+    cancel_event=None,
+) -> SanitizeStats:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with input_path.open("rb") as source, output_path.open("wb") as target:
+            return sanitize_stream(source, target, log, cancel_event)
+    except Exception:
+        output_path.unlink(missing_ok=True)
+        raise
 
 
 def inspect_valid_prefix(
@@ -285,15 +497,15 @@ def default_output_path(
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
-            "Repair an XMEye recording with a truncated tail "
-            "by copying only the complete frame prefix."
+            "Repair an XMEye recording by keeping complete frame records, "
+            "skipping invalid data between records, and trimming a partial tail."
         )
     )
 
     parser.add_argument(
         "input",
         type=Path,
-        help="Input .xmeye file.",
+        help="Input .xmeye or .h265x file.",
     )
 
     parser.add_argument(
@@ -301,8 +513,8 @@ def main() -> None:
         nargs="?",
         type=Path,
         help=(
-            "Output repaired .xmeye file. "
-            "Default: *_repaired.xmeye"
+            "Output repaired recording. "
+            "Default: *_repaired with the original suffix."
         ),
     )
 
@@ -311,7 +523,7 @@ def main() -> None:
         action="store_true",
         help=(
             "Replace the input file after successful repair. "
-            "The original is first renamed to *.broken.xmeye."
+            "The original is first renamed to *.broken with the same suffix."
         ),
     )
 
@@ -336,6 +548,11 @@ def main() -> None:
             input_path
         )
 
+    if output_path == input_path:
+        parser.error(
+            "Output must differ from input; use --replace for a guarded replacement."
+        )
+
     size = input_path.stat().st_size
 
     print(
@@ -346,59 +563,6 @@ def main() -> None:
         f"Input size:   {size:,} bytes"
     )
 
-    (
-        valid_end,
-        valid_frames,
-        skipped_bytes,
-        problem,
-    ) = inspect_valid_prefix(
-        input_path
-    )
-
-    print(
-        f"Valid frames: {valid_frames:,}"
-    )
-
-    print(
-        f"Valid bytes:  {valid_end:,}"
-    )
-
-    if skipped_bytes:
-        print(
-            f"Skipped bytes while scanning: "
-            f"{skipped_bytes:,}"
-        )
-
-    if problem:
-        print(
-            f"Problem:      {problem}"
-        )
-
-    if valid_end <= 0:
-        raise RuntimeError(
-            "No complete XMEye frames were found."
-        )
-
-    if valid_end == size:
-        print()
-        print(
-            "The file already consists entirely "
-            "of complete XMEye frames."
-        )
-
-        if not args.replace:
-            print(
-                "No repaired copy was created."
-            )
-
-        return
-
-    removed = size - valid_end
-
-    print(
-        f"Removing:     {removed:,} trailing byte(s)"
-    )
-
     temp_output = (
         input_path.with_name(
             input_path.name + ".repairing"
@@ -407,19 +571,31 @@ def main() -> None:
         else output_path
     )
 
-    copy_prefix(
+    stats = sanitize_file(
         input_path,
         temp_output,
-        valid_end,
+        print,
     )
 
-    if (
-        temp_output.stat().st_size
-        != valid_end
-    ):
+    print(f"Valid frames: {stats.frame_count:,}")
+    print(f"Valid bytes:  {stats.output_bytes:,}")
+    print(f"Skipped:      {stats.skipped_bytes:,} byte(s)")
+
+    if stats.frame_count <= 0:
+        temp_output.unlink(missing_ok=True)
+        raise RuntimeError("No complete XMEye frames were found.")
+
+    if temp_output.stat().st_size != stats.output_bytes:
         raise RuntimeError(
             "Repaired file size verification failed."
         )
+
+    if stats.skipped_bytes == 0:
+        temp_output.unlink(missing_ok=True)
+        print()
+        print("The file already consists entirely of complete XMEye frames.")
+        print("No repaired copy was created.")
+        return
 
     if args.replace:
         backup_path = input_path.with_name(
