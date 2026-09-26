@@ -4,6 +4,9 @@
 archives, downloading recordings, repairing damaged record streams, and
 converting them to validated MKV files.
 
+The instructions and screenshots in this guide have been verified on Windows.
+Linux support has not yet been tested.
+
 The GUI calls the Python backend directly. It does not parse CLI output, and
 long-running search, download, conversion, and repair work runs outside the UI
 thread.
@@ -19,7 +22,44 @@ Requirements:
 - FFmpeg and `ffprobe` available on `PATH`
 - the packages in `requirements.txt`
 
-From PowerShell:
+### Install FFmpeg on Windows
+
+Both `ffmpeg.exe` and `ffprobe.exe` are required. They are included in the same
+FFmpeg package.
+
+The simplest installation method is WinGet. In PowerShell or Command Prompt:
+
+```powershell
+winget install --id Gyan.FFmpeg.Essentials --exact
+```
+
+If WinGet is unavailable, open the official
+[FFmpeg download page](https://ffmpeg.org/download.html), choose one of the
+linked **Windows EXE Files** providers, download a Windows build, and extract
+it. Add the extracted `bin` directory—the directory containing `ffmpeg.exe`
+and `ffprobe.exe`—to the user or system `PATH`.
+
+After either installation method, close and reopen PowerShell so it receives
+the updated `PATH`, then verify both programs:
+
+```powershell
+ffmpeg -version
+ffprobe -version
+```
+
+If either command is not recognized, FFmpeg is not yet visible on `PATH`. For
+a manual installation, check that the `bin` directory itself, rather than only
+its parent directory, was added. These commands show which executables Windows
+will use when configuration is correct:
+
+```powershell
+Get-Command ffmpeg
+Get-Command ffprobe
+```
+
+### Install the Python packages and launch the GUI
+
+From PowerShell in the repository directory:
 
 ```powershell
 python -m pip install -r requirements.txt
