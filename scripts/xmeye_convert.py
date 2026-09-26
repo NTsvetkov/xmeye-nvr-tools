@@ -71,10 +71,57 @@ class StreamInfo:
     info_timestamps: list[datetime] = field(default_factory=list)
     audio: AudioInfo | None = None
     audio_error: str | None = None
+    timestamp_repairs: int = 0
 
     @property
     def video_frames(self):
         return self.iframe_count + self.pframe_count
+
+
+def normalize_local_timestamp_regressions(keyframes):
+    """Interpolate short, bracketed FC clock regressions without dropping video."""
+    repaired = 0
+    index = 1
+    while index < len(keyframes):
+        if keyframes[index].timestamp >= keyframes[index - 1].timestamp:
+            index += 1
+            continue
+
+        left_index = index - 1
+        left = keyframes[left_index]
+        right_index = index
+        lowest = keyframes[index].timestamp
+        while (
+            right_index < len(keyframes)
+            and keyframes[right_index].timestamp <= left.timestamp
+        ):
+            lowest = min(lowest, keyframes[right_index].timestamp)
+            right_index += 1
+
+        backward = (left.timestamp - lowest).total_seconds()
+        if right_index >= len(keyframes) or backward > MAX_KEYFRAME_GAP:
+            current = keyframes[index]
+            raise RuntimeError(
+                f"Non-monotonic FC timestamps: {left.timestamp}, {current.timestamp}"
+            )
+
+        right = keyframes[right_index]
+        forward = (right.timestamp - left.timestamp).total_seconds()
+        frame_span = right.frame_index - left.frame_index
+        if forward > MAX_KEYFRAME_GAP or forward <= 0 or frame_span <= 0:
+            current = keyframes[index]
+            raise RuntimeError(
+                f"Non-monotonic FC timestamps: {left.timestamp}, {current.timestamp}"
+            )
+
+        for repair_index in range(index, right_index):
+            keyframe = keyframes[repair_index]
+            fraction = (keyframe.frame_index - left.frame_index) / frame_span
+            keyframe.timestamp = left.timestamp + timedelta(seconds=forward * fraction)
+            repaired += 1
+        index = right_index
+
+    return repaired
 
 
 @dataclass
@@ -87,6 +134,11 @@ class Segment:
     frame_count: int
     mode: int
     raw_path: Path | None = None
+    encoded_frames: int | None = None
+    encoded_keyframes: int | None = None
+    dropped_gops: int = 0
+    dropped_frames: int = 0
+    fully_dropped: bool = False
 
     @property
     def duration(self):
@@ -95,6 +147,11 @@ class Segment:
     @property
     def fps(self):
         return self.frame_count / self.duration
+
+    @property
+    def encoded_fps(self):
+        frames = self.frame_count if self.encoded_frames is None else self.encoded_frames
+        return frames / self.duration
 
 
 def decode_datetime(raw):
@@ -287,16 +344,12 @@ def inspect_stream(path):
             "FC codec metadata is not confirmed by encoded parameter sets: "
             f"metadata={codec}, payload={dict(payload_codecs)}"
         )
+    timestamp_repairs = normalize_local_timestamp_regressions(keyframes)
     for previous, current in zip(keyframes, keyframes[1:]):
         gap = (current.timestamp - previous.timestamp).total_seconds()
         if gap < 0:
             raise RuntimeError(
                 f"Non-monotonic FC timestamps: {previous.timestamp}, {current.timestamp}"
-            )
-        if gap > MAX_KEYFRAME_GAP:
-            raise RuntimeError(
-                f"Implausible {gap:g} s FC gap at keyframe {current.number}; "
-                "inspect or repair the recording first."
             )
     if info_timestamps and (
         min(info_timestamps) < keyframes[0].timestamp - timedelta(seconds=1)
@@ -336,6 +389,7 @@ def inspect_stream(path):
         codec, demuxer, keyframes, counts["iframe"], counts["pframe"],
         counts["audio"], counts["info"], counts["snapshot"],
         counts["trailer"], info_timestamps, audio, audio_error,
+        timestamp_repairs,
     )
 
 
@@ -386,11 +440,25 @@ def build_timeline(path, info, anchor_interval, transition_min, forced_fps):
         else:
             end, source = infer_end(info), "FC timestamps (inferred final GOP)"
         final_gap = (end - info.keyframes[-1].timestamp).total_seconds()
-        if end <= first or final_gap <= 0 or final_gap > MAX_KEYFRAME_GAP:
+        if final_gap == 0:
+            end = infer_end(info)
+            source = "FC timestamps (inferred final GOP after zero filename gap)"
+            final_gap = (end - info.keyframes[-1].timestamp).total_seconds()
+        if end <= first or final_gap < 0:
             raise RuntimeError(
                 f"Recording end disagrees with FC timeline (final gap {final_gap:g} s)."
             )
-        required = stable_mode_boundaries(info.keyframes, transition_min)
+        if final_gap > MAX_KEYFRAME_GAP:
+            end = infer_end(info)
+            source = "FC timestamps (recording ended before filename boundary)"
+        discontinuities = {
+            index for index in range(1, len(info.keyframes))
+            if (
+                info.keyframes[index].timestamp
+                - info.keyframes[index - 1].timestamp
+            ).total_seconds() > MAX_KEYFRAME_GAP
+        }
+        required = stable_mode_boundaries(info.keyframes, transition_min) | discontinuities
         boundaries, last_time = [0], first
         for index, keyframe in enumerate(info.keyframes[1:], 1):
             elapsed = (keyframe.timestamp - last_time).total_seconds()
@@ -501,13 +569,27 @@ def extract_audio(path, info, temp_dir):
 def write_concat(path, segments, use_mkv=False):
     with path.open("w", encoding="ascii", newline="\n") as output:
         output.write("ffconcat version 1.0\n")
+        entries = []
         for segment in segments:
+            if use_mkv and segment.fully_dropped:
+                if entries:
+                    entries[-1][1] += segment.duration
+                continue
             source = segment.raw_path.with_suffix(".mkv") if use_mkv else segment.raw_path
+            entries.append([source, segment.duration])
+
+        if not entries:
+            raise RuntimeError("No decodable video segments remain.")
+
+        for source, duration in entries:
             quoted = source.resolve().as_posix().replace("'", r"'\''")
             output.write(f"file '{quoted}'\n")
-            if not use_mkv:
+            if use_mkv:
+                output.write(f"duration {duration:.9f}\n")
+            else:
+                segment = next(item for item in segments if item.raw_path == source)
                 output.write(f"option framerate {segment.fps:.12f}\n")
-                output.write(f"duration {segment.duration:.9f}\n")
+                output.write(f"duration {duration:.9f}\n")
 
 
 def find_executable(name):
@@ -522,20 +604,202 @@ def run(command):
     subprocess.run(command, check=True)
 
 
-def remux(ffmpeg, info, segments, concat_path, output_path, keep_temp, audio_path):
+def probe_encoded_frames(ffprobe, path, demuxer):
+    result = subprocess.run([
+        ffprobe, "-v", "error", "-f", demuxer, "-select_streams", "v:0",
+        "-show_packets", "-show_entries", "packet=flags", "-of", "csv=p=0",
+        str(path),
+    ], check=True, capture_output=True, text=True)
+    flags = result.stdout.splitlines()
+    if not flags:
+        raise RuntimeError(f"Could not count encoded frames in {path.name}.")
+    return len(flags), sum("K" in value for value in flags)
+
+
+def count_encoded_frames(ffprobe, path, demuxer):
+    return probe_encoded_frames(ffprobe, path, demuxer)[0]
+
+
+def timestamp_stream(ffmpeg, info, segment, output_path):
+    return subprocess.run([
+        ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
+        "-r", f"{segment.encoded_fps:.12f}", "-f", info.demuxer,
+        "-i", str(segment.raw_path), "-an", "-c:v", "copy",
+        str(output_path),
+    ], capture_output=True, text=True)
+
+
+def decode_video(ffmpeg, path):
+    result = subprocess.run([
+        ffmpeg, "-hide_banner", "-loglevel", "error", "-xerror",
+        "-i", str(path), "-map", "0:v:0", "-f", "null", os.devnull,
+    ], capture_output=True, text=True)
+    return result.returncode == 0, result.stderr.strip()
+
+
+def extract_segment_gops(path, info, segment, output_dir):
+    suffix = ".h264" if info.codec == "h264" else ".h265"
+    gops = []
+    output = None
+    key_number = -1
+    try:
+        with path.open("rb") as source, mmap.mmap(
+            source.fileno(), 0, access=mmap.ACCESS_READ
+        ) as data:
+            size, pos = len(data), 0
+            while pos < size and pos + 4 <= size and data[pos:pos + 3] == MAGIC:
+                kind, start, end = frame_bounds(data, pos, size)
+                if kind == IFRAME:
+                    if output:
+                        output.close()
+                        output = None
+                    key_number += 1
+                    if key_number >= segment.end_keyframe:
+                        break
+                    if key_number >= segment.start_keyframe:
+                        gop_path = output_dir / f"gop_{key_number:06d}{suffix}"
+                        output = gop_path.open("wb")
+                        gops.append((key_number, gop_path))
+                if output and kind in (IFRAME, PFRAME):
+                    output.write(data[start:end])
+                pos = end
+    finally:
+        if output:
+            output.close()
+    return gops
+
+
+def gop_frame_count(info, key_number):
+    start = info.keyframes[key_number].frame_index
+    if key_number + 1 < len(info.keyframes):
+        end = info.keyframes[key_number + 1].frame_index
+    else:
+        end = info.video_frames
+    return end - start
+
+
+def recover_segment(path, ffmpeg, ffprobe, info, segment, temp_dir):
+    recovery_dir = temp_dir / f"segment_{segment.index:04d}_recovery"
+    recovery_dir.mkdir()
+    gops = extract_segment_gops(path, info, segment, recovery_dir)
+    if not gops:
+        raise RuntimeError(f"No GOPs found while repairing segment {segment.index + 1}.")
+
+    suffix = ".h264" if info.codec == "h264" else ".h265"
+    repaired_path = temp_dir / f"segment_{segment.index:04d}_repaired{suffix}"
+    dropped = []
+    with repaired_path.open("wb") as repaired:
+        for key_number, gop_path in gops:
+            gop_mkv = gop_path.with_suffix(".mkv")
+            remuxed = subprocess.run([
+                ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
+                "-r", "25", "-f", info.demuxer, "-i", str(gop_path),
+                "-an", "-c:v", "copy", str(gop_mkv),
+            ], capture_output=True, text=True)
+            clean, error = (False, remuxed.stderr.strip())
+            if remuxed.returncode == 0:
+                clean, error = decode_video(ffmpeg, gop_mkv)
+            if not clean:
+                dropped.append((key_number, gop_frame_count(info, key_number), error))
+                continue
+            with gop_path.open("rb") as source:
+                shutil.copyfileobj(source, repaired, length=1024 * 1024)
+
+    if repaired_path.stat().st_size == 0:
+        segment.encoded_frames = 0
+        segment.encoded_keyframes = 0
+        segment.dropped_gops = len(dropped)
+        segment.dropped_frames = sum(frames for _, frames, _ in dropped)
+        segment.fully_dropped = True
+        repaired_path.unlink(missing_ok=True)
+        for key_number, frames, error in dropped:
+            timestamp = info.keyframes[key_number].timestamp
+            detail = error.splitlines()[0] if error else "invalid encoded GOP"
+            print(
+                f"\n  Recovery: dropped damaged GOP at {timestamp} "
+                f"({frames} XMEye frame(s)): {detail}"
+            )
+        print(
+            f"\n  Recovery: omitted fully damaged interval "
+            f"{segment.start} - {segment.end} ({segment.duration:.3f} s)."
+        )
+        return None
+
+    segment.raw_path = repaired_path
+    segment.encoded_frames, segment.encoded_keyframes = probe_encoded_frames(
+        ffprobe, repaired_path, info.demuxer
+    )
+    segment.dropped_gops = len(dropped)
+    segment.dropped_frames = sum(frames for _, frames, _ in dropped)
+    output_path = repaired_path.with_suffix(".mkv")
+    remuxed = timestamp_stream(ffmpeg, info, segment, output_path)
+    if remuxed.returncode != 0:
+        raise RuntimeError(
+            f"Repaired segment {segment.index + 1} could not be timestamped: "
+            f"{remuxed.stderr.strip()}"
+        )
+    clean, error = decode_video(ffmpeg, output_path)
+    if not clean:
+        raise RuntimeError(
+            f"Repaired segment {segment.index + 1} still fails decoding: {error}"
+        )
+
+    for key_number, frames, error in dropped:
+        timestamp = info.keyframes[key_number].timestamp
+        detail = error.splitlines()[0] if error else "invalid encoded GOP"
+        print(
+            f"\n  Recovery: dropped damaged GOP at {timestamp} "
+            f"({frames} XMEye frame(s)): {detail}"
+        )
+    return output_path
+
+
+def timestamp_segments(path, ffmpeg, ffprobe, info, segments, temp_dir):
     # Raw H.26x has no packet timestamps. Remux each anchor interval first;
-    # then the concat demuxer sees timestamped inputs. Both stages stream-copy.
+    # then the concat demuxer sees timestamped inputs. This is the optimistic
+    # stream-copy path; decoding is performed once on the complete result.
     for number, segment in enumerate(segments, 1):
         print(f"  Timestamping part {number}/{len(segments)}", end="\r", flush=True)
-        subprocess.run([
-            ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
-            "-r", f"{segment.fps:.12f}", "-f", info.demuxer,
-            "-i", str(segment.raw_path), "-an", "-c:v", "copy",
-            str(segment.raw_path.with_suffix(".mkv")),
-        ], check=True)
-        if not keep_temp:
-            segment.raw_path.unlink()
+        segment.encoded_frames, segment.encoded_keyframes = probe_encoded_frames(
+            ffprobe, segment.raw_path, info.demuxer
+        )
+        output_segment = segment.raw_path.with_suffix(".mkv")
+        remuxed = timestamp_stream(ffmpeg, info, segment, output_segment)
+        if remuxed.returncode != 0:
+            output_segment.unlink(missing_ok=True)
+            output_segment = recover_segment(
+                path, ffmpeg, ffprobe, info, segment, temp_dir
+            )
+            if output_segment is None:
+                segment.raw_path = None
     print(" " * 60, end="\r")
+
+
+def recover_decoding_segments(path, ffmpeg, ffprobe, info, segments, temp_dir):
+    recovered = False
+    for number, segment in enumerate(segments, 1):
+        if segment.fully_dropped:
+            continue
+        output_segment = segment.raw_path.with_suffix(".mkv")
+        clean, error = decode_video(ffmpeg, output_segment)
+        if clean:
+            continue
+        recovered = True
+        detail = error.splitlines()[0] if error else "invalid encoded segment"
+        print(
+            f"  Strict decode failed in part {number}/{len(segments)}: {detail}\n"
+            "  Falling back to GOP-level recovery."
+        )
+        output_segment.unlink(missing_ok=True)
+        output_segment = recover_segment(
+            path, ffmpeg, ffprobe, info, segment, temp_dir
+        )
+        if output_segment is None:
+            segment.raw_path = None
+    return recovered
+
+
+def mux_segments(ffmpeg, info, segments, concat_path, output_path, audio_path):
     write_concat(concat_path, segments, use_mkv=True)
     command = [
         ffmpeg, "-hide_banner", "-loglevel", "warning", "-y",
@@ -632,18 +896,38 @@ def validate_audio(ffprobe, path, audio):
     return end
 
 
-def validate_output(ffprobe, path, info, expected_duration):
+def validate_output(ffprobe, path, info, segments, expected_duration):
     summary = probe_summary(ffprobe, path)
     streams = summary.get("streams", [])
     if len(streams) != 1 or streams[0].get("codec_name") != info.codec:
         raise RuntimeError("Output video stream/codec validation failed.")
     count, keys, first_pts, video_end = validate_packets(ffprobe, path)
-    if count != info.video_frames or keys != info.iframe_count:
+    expected_packets = sum(
+        segment.frame_count if segment.encoded_frames is None else segment.encoded_frames
+        for segment in segments
+    )
+    expected_keys = sum(
+        segment.encoded_keyframes
+        if segment.encoded_keyframes is not None
+        else segment.end_keyframe - segment.start_keyframe
+        for segment in segments
+    )
+    if count != expected_packets or keys != expected_keys:
         raise RuntimeError(
             f"Output packets/keyframes {count}/{keys}; expected "
-            f"{info.video_frames}/{info.iframe_count}."
+            f"{expected_packets}/{expected_keys}."
         )
-    if abs(video_end - expected_duration) > max(0.100, expected_duration * 0.0001):
+    frame_tolerance = max(
+        (
+            1.0 / segment.encoded_fps
+            for segment in segments
+            if not segment.fully_dropped and segment.encoded_fps > 0
+        ),
+        default=0.0,
+    ) + 0.005
+    if abs(video_end - expected_duration) > max(
+        0.100, expected_duration * 0.0001, frame_tolerance
+    ):
         raise RuntimeError(
             f"Output video duration {video_end:.3f} s; expected {expected_duration:.3f} s."
         )
@@ -687,6 +971,8 @@ def print_analysis(info, segments, end, end_source):
     print(f"Snapshots:      {info.snapshot_count:,}")
     print(f"FC first:       {first}")
     print(f"FC last:        {info.keyframes[-1].timestamp}")
+    if info.timestamp_repairs:
+        print(f"FC repairs:     {info.timestamp_repairs:,} locally regressed timestamp(s) interpolated")
     print(f"Recording end:  {end} ({end_source})")
     print(f"Duration:       {duration:.3f} s ({duration / 60:.2f} min)")
     print(f"FC modes/FPS:   {dict(sorted(modes.items()))}")
@@ -730,14 +1016,33 @@ def convert(path, output_path, keep_temp, anchor_interval, transition_min, force
         audio_path = extract_audio(path, info, temp_dir)
         concat_path = temp_dir / "timeline.ffconcat"
         print("\nRemuxing reconstructed video and original audio (stream copy)...")
-        remux(
-            ffmpeg, info, segments, concat_path, temporary_output,
-            keep_temp, audio_path,
+        timestamp_segments(path, ffmpeg, ffprobe, info, segments, temp_dir)
+        mux_segments(
+            ffmpeg, info, segments, concat_path, temporary_output, audio_path
         )
+        print("\nStrict-decoding the complete fast-path result...")
+        clean, error = decode_video(ffmpeg, temporary_output)
+        if not clean:
+            print("Fast-path decode failed; locating damaged timeline parts...")
+            temporary_output.unlink(missing_ok=True)
+            recover_decoding_segments(
+                path, ffmpeg, ffprobe, info, segments, temp_dir
+            )
+            mux_segments(
+                ffmpeg, info, segments, concat_path, temporary_output, audio_path
+            )
+            clean, error = decode_video(ffmpeg, temporary_output)
+            if not clean:
+                detail = error.splitlines()[0] if error else "unknown decode error"
+                raise RuntimeError(
+                    f"Recovered output still fails strict decoding: {detail}"
+                )
         print("\nValidating streams, durations, and packet timestamps...")
         duration, video_duration, audio_duration, packets, keys, _ = validate_output(
-            ffprobe, temporary_output, info, expected
+            ffprobe, temporary_output, info, segments, expected
         )
+        dropped_gops = sum(segment.dropped_gops for segment in segments)
+        dropped_frames = sum(segment.dropped_frames for segment in segments)
         os.replace(temporary_output, output_path)
         print(
             f"Validated: {packets:,} packets, {keys:,} keyframes, "
@@ -748,6 +1053,11 @@ def convert(path, output_path, keep_temp, anchor_interval, transition_min, force
                 f"Audio validated: {info.audio.codec}, {info.audio.sample_rate} Hz, "
                 f"{info.audio.channels} ch, {audio_duration:.3f} s, "
                 f"A/V difference {audio_duration - video_duration:+.3f} s"
+            )
+        if dropped_gops:
+            print(
+                f"Recovery validated: dropped {dropped_gops} damaged GOP(s), "
+                f"{dropped_frames:,} XMEye frame record(s)."
             )
         print(f"Container duration: {duration:.3f} s")
         print(f"\nDone: {output_path}")

@@ -20,6 +20,8 @@ rather than being duplicated here.
 ## Requirements
 
 - Python 3.10+
+- Converting recordings to MKV requires both `ffmpeg` and `ffprobe` on
+  `PATH`. See the [Windows installation instructions](docs/GUI_GUIDE.md#install-ffmpeg-on-windows).
 - Most scripts use only the standard library.
 - Scripts that decode video frames (see table below) need
   [PyAV](https://pyav.org/) and Pillow:
@@ -34,6 +36,19 @@ its full option list; each also has a detailed module docstring explaining
 what it does and why.
 
 ## Where to start
+
+Launch the desktop GUI after installing the requirements:
+
+```powershell
+python scripts/nvr_gui.py
+```
+
+The GUI reads the NVR password from the `XMEYE_PASSWORD` environment variable.
+
+![XMEye NVR Tools search results](docs/images/gui-search-results.png)
+
+See the **[desktop GUI guide](docs/GUI_GUIDE.md)** for installation, search,
+download queue, conversion, cancellation, repair, and file-retention details.
 
 - **New/unknown device?** Run `identify_nvr.py` first (port scan + login +
   device info), then `rtsp_probe.py` to find a working RTSP URL.
