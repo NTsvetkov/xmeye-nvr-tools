@@ -2,7 +2,7 @@
 
 `nvr_gui.py` is a Windows-friendly desktop front end for searching XMEye NVR
 archives, downloading recordings, repairing damaged record streams, and
-converting them to validated MKV files.
+converting them to validated MP4 files.
 
 The instructions and screenshots in this guide have been verified on Windows.
 Linux support has not yet been tested.
@@ -89,23 +89,29 @@ discard already selected recordings. The **Local status** column reports:
 
 - `not downloaded`
 - `raw present`
-- `MKV present`
-- `both`
+- `MP4 present`
+- `raw + MP4`
+- `legacy MKV present` (and combinations with raw/MP4 files)
 
 The status is cached while the table is displayed and refreshed after file
 operations, avoiding repeated filesystem scans during painting and sorting.
 
 ## Processing options
 
-### Convert to MKV
+### Convert to MP4
 
 Runs the timestamp-aware converter after downloading. The converter:
 
 - preserves the encoded H.264/H.265 video rather than re-encoding it;
-- preserves supported FA audio when present;
+- copies AAC audio when present and converts G.711 A-law audio to AAC;
 - reconstructs monotonic packet timestamps from XMEye FC/GOP timestamps;
 - strict-decodes and validates the complete output before publication;
-- writes the final MKV atomically.
+- writes the final MP4 atomically.
+
+Existing `.mkv` files are left untouched and shown as legacy files. They do
+not count as a completed MP4 conversion, so a retained `.xmeye` source can be
+converted again without downloading it. If only a legacy MKV remains, the raw
+recording must be downloaded again before an MP4 can be created.
 
 If structural XMEye damage prevents conversion, the backend creates a temporary
 sanitized copy and retries once. The original retained `.xmeye` file is not
@@ -119,12 +125,13 @@ option is enabled.
 
 Leave the option disabled when the source stream may be useful for later
 analysis or a different conversion. Enable it for routine downloads where the
-validated MKV is the desired final artifact.
+validated MP4 is the desired final artifact.
 
 ### Parallel work and free-space limit
 
 - **Parallel downloads** controls simultaneous DVRIP transfers.
-- **Parallel conversions** controls simultaneous FFmpeg processes.
+- **Parallel conversions** controls simultaneous FFmpeg processes and defaults
+  to one, because strict HEVC decoding can be CPU intensive.
 - **Keep free space** pauses the queue before a new download when free disk
   space falls below the configured percentage.
 
@@ -151,7 +158,8 @@ Right-click a queue row for:
 
 - **Download again** — force a fresh download for that recording;
 - **Stop** — stop a queued, downloading, or converting item;
-- **Delete local file** — explicitly delete its local raw and/or MKV files;
+- **Delete local file** — explicitly delete its local raw, MP4, and/or legacy
+  MKV files;
 - **Remove from queue** — remove an inactive queue entry.
 
 Closing the window while work is active first disables new scheduling,
@@ -218,10 +226,17 @@ The raw input is retained. Review the log for structural damage, unsupported
 audio, strict-decode errors, or missing FFmpeg executables. You can retry the
 queue item or run the manual repair command while preserving the source.
 
-### Seeking repeatedly in VLC reaches the end early
+### A partial recording starts before its first keyframe
 
-The converted stream has validated monotonic timestamps, but repeated relative
-seek commands in VLC can make its displayed clock drift from the decoded frame,
-especially around GOP/keyframe boundaries. A single direct seek or normal
-playback near the end avoids that player-side effect; it does not indicate
-extra packets beyond the validated MKV duration.
+Some NVR-generated fragments begin with P-frames that cannot be decoded without
+an earlier I-frame. Conversion drops only those leading undecodable video
+frames and any audio before the first keyframe, then validates and publishes
+the remaining recording. The original `.xmeye` file is not modified.
+
+### VLC used to pause or jump at the end of converted files
+
+Older releases wrote Matroska (`.mkv`) output. Repeated relative seeking in VLC
+could reach the end of its seek range before playback reached the last decoded
+frames. Current releases write MP4 instead; the encoded video is still copied
+without quality loss, while G.711 A-law audio is converted to AAC when needed
+for MP4 compatibility.

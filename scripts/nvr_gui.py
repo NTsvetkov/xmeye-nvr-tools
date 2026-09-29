@@ -540,8 +540,11 @@ class ResultsModel(QAbstractTableModel):
             if column == 3:
                 return QColor(c["muted"])
             status = self._local_status(item)
-            return QColor({"MKV present": c["green"], "both": c["green"],
-                           "raw present": c["amber"]}.get(status, c["muted"]))
+            if "MP4" in status:
+                return QColor(c["green"])
+            if status != "not downloaded":
+                return QColor(c["amber"])
+            return QColor(c["muted"])
         if role == Qt.ItemDataRole.FontRole and column in (2, 3):
             return mono_font()
         if role == Qt.ItemDataRole.TextAlignmentRole and column in (4, 5):
@@ -952,7 +955,7 @@ class MainWindow(QMainWindow):
         layout.addSpacing(14)
 
         layout.addWidget(self._section("Processing"))
-        self.convert_check = ToggleSwitch("Convert to MKV")
+        self.convert_check = ToggleSwitch("Convert to MP4")
         self.delete_raw_check = ToggleSwitch("Delete raw after conversion")
         layout.addWidget(self.convert_check)
         layout.addWidget(self.delete_raw_check)
@@ -1237,7 +1240,7 @@ class MainWindow(QMainWindow):
         self.delete_raw_check.setChecked(self.settings.value("delete_raw", False, type=bool))
         self.delete_raw_check.setEnabled(self.convert_check.isChecked())
         self.downloads_spin.setValue(int(self.settings.value("concurrent_downloads", 2)))
-        self.conversions_spin.setValue(int(self.settings.value("concurrent_conversions", 2)))
+        self.conversions_spin.setValue(int(self.settings.value("concurrent_conversions", 1)))
         self.min_free_spin.setValue(float(self.settings.value("minimum_free_percent", 5.0)))
         page_size = str(self.settings.value("result_page_size", "100"))
         index = self.page_size_combo.findText(page_size)
@@ -1728,7 +1731,9 @@ class MainWindow(QMainWindow):
             or any(waiting.key == entry.key for waiting, _ in self.waiting_conversion)
         )
         delete_local.setEnabled(
-            not active and (paths.raw.is_file() or paths.mkv.is_file())
+            not active and any(
+                path.is_file() for path in (paths.raw, paths.mp4, paths.legacy_mkv)
+            )
         )
         stop.setEnabled(entry.status in {
             "Queued", "Downloading", "Converting (waiting)", "Converting",
@@ -1786,7 +1791,11 @@ class MainWindow(QMainWindow):
 
     def _delete_local_files(self, entry):
         paths = local_paths(entry.item, entry.output_dir)
-        existing = [path.resolve() for path in (paths.raw, paths.mkv) if path.is_file()]
+        existing = [
+            path.resolve()
+            for path in (paths.raw, paths.mp4, paths.legacy_mkv)
+            if path.is_file()
+        ]
         if not existing:
             return
         exact_paths = "\n".join(str(path) for path in existing)
