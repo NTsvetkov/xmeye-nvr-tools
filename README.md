@@ -20,7 +20,7 @@ rather than being duplicated here.
 ## Requirements
 
 - Python 3.10+
-- Converting recordings to MKV requires both `ffmpeg` and `ffprobe` on
+- Converting recordings to MP4 requires both `ffmpeg` and `ffprobe` on
   `PATH`. See the [Windows installation instructions](docs/GUI_GUIDE.md#install-ffmpeg-on-windows).
 - Most scripts use only the standard library.
 - Scripts that decode video frames (see table below) need

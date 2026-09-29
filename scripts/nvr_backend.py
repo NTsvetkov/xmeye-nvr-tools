@@ -50,13 +50,14 @@ class RecordingRef:
 @dataclass(frozen=True)
 class LocalPaths:
     raw: Path
-    mkv: Path
+    mp4: Path
+    legacy_mkv: Path
 
 
 @dataclass(frozen=True)
 class DownloadOutcome:
     raw_path: Path
-    mkv_path: Path
+    mp4_path: Path
     downloaded: bool
     conversion_needed: bool
 
@@ -136,19 +137,32 @@ def _check_cancel(cancel_event: threading.Event | None) -> None:
 
 def local_paths(item: RecordingRef, output_dir: Path) -> LocalPaths:
     raw = output_dir / safe_filename(item.recording, item.channel)
-    return LocalPaths(raw=raw, mkv=raw.with_suffix(".mkv"))
+    return LocalPaths(
+        raw=raw,
+        mp4=raw.with_suffix(".mp4"),
+        legacy_mkv=raw.with_suffix(".mkv"),
+    )
 
 
 def local_status(item: RecordingRef, output_dir: Path) -> str:
     paths = local_paths(item, output_dir)
     raw_present = paths.raw.is_file()
-    mkv_present = paths.mkv.is_file()
-    if raw_present and mkv_present:
-        return "both"
+    mp4_present = paths.mp4.is_file()
+    legacy_mkv_present = paths.legacy_mkv.is_file()
+    if raw_present and mp4_present and legacy_mkv_present:
+        return "raw + MP4 + legacy MKV"
+    if mp4_present and legacy_mkv_present:
+        return "MP4 + legacy MKV"
+    if raw_present and mp4_present:
+        return "raw + MP4"
+    if raw_present and legacy_mkv_present:
+        return "raw + legacy MKV"
     if raw_present:
         return "raw present"
-    if mkv_present:
-        return "MKV present"
+    if mp4_present:
+        return "MP4 present"
+    if legacy_mkv_present:
+        return "legacy MKV present"
     return "not downloaded"
 
 
@@ -226,9 +240,9 @@ def prepare_download(
     paths = local_paths(item, output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    if not force and convert and paths.mkv.is_file():
-        log(f"MKV already exists; skipping download: {paths.mkv.name}")
-        return DownloadOutcome(paths.raw, paths.mkv, False, False)
+    if not force and convert and paths.mp4.is_file():
+        log(f"MP4 already exists; skipping download: {paths.mp4.name}")
+        return DownloadOutcome(paths.raw, paths.mp4, False, False)
 
     if not force and paths.raw.is_file():
         # Downloads are written to .part and atomically published as .xmeye
@@ -236,7 +250,7 @@ def prepare_download(
         # reliable completion check on these devices, so the final filename
         # itself is the durable completion state.
         log(f"Raw recording already exists: {paths.raw.name}")
-        return DownloadOutcome(paths.raw, paths.mkv, False, convert)
+        return DownloadOutcome(paths.raw, paths.mp4, False, convert)
 
     free, total, percent = disk_free_info(output_dir)
     if min_free_percent > 0 and percent < min_free_percent:
@@ -275,7 +289,7 @@ def prepare_download(
             _check_cancel(cancel_event)
             os.replace(part_path, paths.raw)
             log(f"Download complete: {paths.raw.name}")
-            return DownloadOutcome(paths.raw, paths.mkv, True, convert)
+            return DownloadOutcome(paths.raw, paths.mp4, True, convert)
         except InterruptedError as exc:
             part_path.unlink(missing_ok=True)
             raise CancelledError(str(exc)) from exc
@@ -358,12 +372,12 @@ def convert_recording(
     """Convert once, then sanitize structural damage and retry exactly once."""
     _check_cancel(cancel_event)
     converter = Path(__file__).with_name("xmeye_convert.py")
-    output_path = raw_path.with_suffix(".mkv")
+    output_path = raw_path.with_suffix(".mp4")
     if output_path.is_file() and not force:
-        log(f"MKV already exists; skipping conversion: {output_path.name}")
+        log(f"MP4 already exists; skipping conversion: {output_path.name}")
         return ConversionOutcome(output_path, False)
 
-    log(f"Converting to MKV: {output_path.name}")
+    log(f"Converting to MP4: {output_path.name}")
     repaired = False
     try:
         _run_converter_process(converter, raw_path, output_path, cancel_event)
@@ -398,7 +412,7 @@ def convert_recording(
             ) from retry_error
 
     if not output_path.is_file():
-        raise RuntimeError("Conversion finished without creating the MKV file.")
+        raise RuntimeError("Conversion finished without creating the MP4 file.")
     log(f"Conversion complete: {output_path.name}")
     return ConversionOutcome(output_path, repaired)
 

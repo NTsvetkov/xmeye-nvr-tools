@@ -947,7 +947,7 @@ def convert_recording(
     raw_path: Path,
 ) -> Path:
     """
-    Convert a downloaded XMEye recording to MKV by invoking
+    Convert a downloaded XMEye recording to MP4 by invoking
     xmeye_convert.py with the current Python interpreter.
     """
     converter = Path(__file__).with_name(
@@ -960,7 +960,7 @@ def convert_recording(
         )
 
     output_path = raw_path.with_suffix(
-        ".mkv"
+        ".mp4"
     )
 
     command = [
@@ -973,7 +973,7 @@ def convert_recording(
     print()
 
     print(
-        f"Converting to MKV: "
+        f"Converting to MP4: "
         f"{output_path.name}"
     )
 
@@ -1087,7 +1087,7 @@ def main() -> None:
         action="store_true",
         help=(
             "Convert downloaded XMEye "
-            "recordings to MKV."
+            "recordings to MP4."
         ),
     )
 
@@ -1321,20 +1321,20 @@ def main() -> None:
                 f"Output: {output_path}"
             )
 
-            mkv_path = (
+            mp4_path = (
                 output_path
-                .with_suffix(".mkv")
+                .with_suffix(".mp4")
             )
 
-            # When converting to MKV, an existing MKV means this
+            # When converting to MP4, an existing MP4 means this
             # recording has already been completed successfully.
             # Skip the raw download as well, which makes repeated
             # batch runs safe after --delete-raw removed the .xmeye.
-            if args.convert and mkv_path.is_file():
+            if args.convert and mp4_path.is_file():
                 print(
-                    "MKV already exists, "
+                    "MP4 already exists, "
                     "skipping download and conversion: "
-                    f"{mkv_path}"
+                    f"{mp4_path}"
                 )
                 continue
 
@@ -1432,22 +1432,22 @@ def main() -> None:
                     continue
 
             if args.convert:
-                if mkv_path.is_file():
+                if mp4_path.is_file():
                     print(
-                        "MKV already exists, "
+                        "MP4 already exists, "
                         "skipping conversion: "
-                        f"{mkv_path}"
+                        f"{mp4_path}"
                     )
 
                 else:
                     try:
-                        mkv_path = convert_recording(
+                        mp4_path = convert_recording(
                             output_path
                         )
 
                         print(
                             f"Converted: "
-                            f"{mkv_path}"
+                            f"{mp4_path}"
                         )
 
                         if args.delete_raw:

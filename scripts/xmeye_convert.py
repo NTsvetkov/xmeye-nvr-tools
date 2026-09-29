@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Timestamp-aware, stream-copy XMEye to MKV converter."""
+"""Timestamp-aware XMEye to MP4 converter with video stream copy."""
 
 import argparse
 import json
@@ -72,6 +72,8 @@ class StreamInfo:
     audio: AudioInfo | None = None
     audio_error: str | None = None
     timestamp_repairs: int = 0
+    leading_pframes: int = 0
+    leading_audio_frames: int = 0
 
     @property
     def video_frames(self):
@@ -295,10 +297,15 @@ def inspect_stream(path):
                         payload_codecs[found] += 1
             elif kind == PFRAME:
                 if not keyframes:
-                    raise RuntimeError(f"P-frame before first keyframe at 0x{pos:X}")
-                counts["pframe"] += 1
-                video_index += 1
+                    counts["leading_pframe"] += 1
+                else:
+                    counts["pframe"] += 1
+                    video_index += 1
             elif kind == AUDIO:
+                if not keyframes:
+                    counts["leading_audio"] += 1
+                    pos = payload_end
+                    continue
                 counts["audio"] += 1
                 header = bytes(data[pos + 4:pos + 6])
                 length = payload_end - payload_start
@@ -389,7 +396,7 @@ def inspect_stream(path):
         codec, demuxer, keyframes, counts["iframe"], counts["pframe"],
         counts["audio"], counts["info"], counts["snapshot"],
         counts["trailer"], info_timestamps, audio, audio_error,
-        timestamp_repairs,
+        timestamp_repairs, counts["leading_pframe"], counts["leading_audio"],
     )
 
 
@@ -512,7 +519,8 @@ def extract_segments(path, info, segments, temp_dir):
                     written += 1
                 elif kind == PFRAME:
                     if output is None:
-                        raise RuntimeError("P-frame before extracted keyframe.")
+                        pos = end
+                        continue
                     output.write(data[start:end])
                     written += 1
                 pos = end
@@ -547,10 +555,12 @@ def extract_audio(path, info, temp_dir):
     with path.open("rb") as source, mmap.mmap(
         source.fileno(), 0, access=mmap.ACCESS_READ
     ) as data, output_path.open("wb") as output:
-        size, pos = len(data), 0
+        size, pos, video_started = len(data), 0, False
         while pos < size and pos + 4 <= size and data[pos:pos + 3] == MAGIC:
             kind, start, end = frame_bounds(data, pos, size)
-            if kind == AUDIO:
+            if kind == IFRAME:
+                video_started = True
+            elif kind == AUDIO and video_started:
                 payload_start = start + info.audio.strip_bytes
                 if payload_start > end:
                     raise RuntimeError(f"Malformed audio frame at 0x{pos:X}")
@@ -815,10 +825,15 @@ def mux_segments(ffmpeg, info, segments, concat_path, output_path, audio_path):
             ])
         command.extend(["-i", str(audio_path)])
     command.extend(["-map", "0:v:0", "-c:v", "copy"])
+    if info.codec == "hevc":
+        command.extend(["-tag:v", "hvc1"])
     if audio_path is None:
         command.append("-an")
+    elif info.audio.codec == "pcm_alaw":
+        command.extend(["-map", "1:a:0", "-c:a", "aac", "-b:a", "32k"])
     else:
         command.extend(["-map", "1:a:0", "-c:a", "copy"])
+    command.extend(["-movflags", "+faststart"])
     command.append(str(output_path))
     run(command)
 
@@ -875,7 +890,8 @@ def validate_audio(ffprobe, path, audio):
         stream.get("codec_name"), int(stream.get("sample_rate", 0)),
         int(stream.get("channels", 0)),
     )
-    expected = (audio.codec, audio.sample_rate, audio.channels)
+    output_codec = "aac" if audio.codec == "pcm_alaw" else audio.codec
+    expected = (output_codec, audio.sample_rate, audio.channels)
     if actual != expected:
         raise RuntimeError(f"Output audio parameters {actual}; expected {expected}.")
     previous = None
@@ -949,6 +965,11 @@ def print_analysis(info, segments, end, end_source):
     print(f"P-frames:       {info.pframe_count:,}")
     print(f"Video frames:   {info.video_frames:,}")
     print(f"Audio frames:   {info.audio_count:,}")
+    if info.leading_pframes or info.leading_audio_frames:
+        print(
+            f"Leading drop:   {info.leading_pframes:,} P-frame(s), "
+            f"{info.leading_audio_frames:,} audio frame(s) before first keyframe"
+        )
     if info.audio:
         common_lengths = info.audio.packet_lengths.most_common(5)
         lengths = ", ".join(
@@ -1009,13 +1030,16 @@ def convert(path, output_path, keep_temp, anchor_interval, transition_min, force
     else:
         context = tempfile.TemporaryDirectory(prefix="xmeye_convert_", dir=output_path.parent)
         temp_dir = Path(context.name)
-    temporary_output = temp_dir / f"{output_path.stem}.converting.mkv"
+    temporary_output = temp_dir / f"{output_path.stem}.converting.mp4"
     try:
         print("\nExtracting timestamp segments...")
         extract_segments(path, info, segments, temp_dir)
         audio_path = extract_audio(path, info, temp_dir)
         concat_path = temp_dir / "timeline.ffconcat"
-        print("\nRemuxing reconstructed video and original audio (stream copy)...")
+        if info.audio and info.audio.codec == "pcm_alaw":
+            print("\nMuxing reconstructed video (copy) and converting A-law audio to AAC...")
+        else:
+            print("\nMuxing reconstructed video and audio (stream copy)...")
         timestamp_segments(path, ffmpeg, ffprobe, info, segments, temp_dir)
         mux_segments(
             ffmpeg, info, segments, concat_path, temporary_output, audio_path
@@ -1050,7 +1074,9 @@ def convert(path, output_path, keep_temp, anchor_interval, transition_min, force
         )
         if audio_duration is not None:
             print(
-                f"Audio validated: {info.audio.codec}, {info.audio.sample_rate} Hz, "
+                f"Audio validated: "
+                f"{'aac' if info.audio.codec == 'pcm_alaw' else info.audio.codec}, "
+                f"{info.audio.sample_rate} Hz, "
                 f"{info.audio.channels} ch, {audio_duration:.3f} s, "
                 f"A/V difference {audio_duration - video_duration:+.3f} s"
             )
@@ -1070,8 +1096,8 @@ def convert(path, output_path, keep_temp, anchor_interval, transition_min, force
 
 def main():
     parser = argparse.ArgumentParser(description=(
-        "Convert XMEye DVRIP recording to MKV without re-encoding, using "
-        "FC/GOP timestamps for the timeline."
+        "Convert XMEye DVRIP recording to MP4 without re-encoding video, "
+        "using FC/GOP timestamps for the timeline."
     ))
     parser.add_argument("input", type=Path)
     parser.add_argument("output", nargs="?", type=Path)
@@ -1094,9 +1120,11 @@ def main():
     path = args.input.resolve()
     if not path.is_file():
         parser.error(f"Input file does not exist: {path}")
-    output = args.output.resolve() if args.output else path.with_suffix(".mkv")
+    output = args.output.resolve() if args.output else path.with_suffix(".mp4")
     if path == output:
         parser.error("Input and output paths must differ.")
+    if output.suffix.lower() != ".mp4":
+        parser.error("Output must use the .mp4 extension.")
     try:
         convert(path, output, args.keep_temp, args.anchor_interval,
                 args.transition_min_seconds, args.fps)
