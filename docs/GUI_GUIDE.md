@@ -63,14 +63,13 @@ From PowerShell in the repository directory:
 
 ```powershell
 python -m pip install -r requirements.txt
-$env:XMEYE_PASSWORD = "your NVR password"
 python scripts\nvr_gui.py
 ```
 
-The password is read from `XMEYE_PASSWORD` when an operation starts. It is not
-saved in `QSettings` and is never displayed in the interface. Restart the GUI
-after setting the variable if it was launched from a process that did not
-inherit it.
+Enter the password in the masked **Password** field. It remains in memory for
+the current GUI session and is not saved in `QSettings`. You may instead set
+`XMEYE_PASSWORD` before launching the GUI; its value pre-fills the same masked
+field for that session.
 
 ## Search recordings
 
@@ -206,14 +205,10 @@ repair attempt when it encounters recognized structural damage.
 
 ## Troubleshooting
 
-### `XMEYE_PASSWORD is not set`
+### The GUI reports `Password required`
 
-Set the variable in the same PowerShell session before starting the GUI:
-
-```powershell
-$env:XMEYE_PASSWORD = "your NVR password"
-python scripts\nvr_gui.py
-```
+Enter the password in the masked sidebar field, or set `XMEYE_PASSWORD` before
+launching the GUI. The password is intentionally not retained after exit.
 
 ### A download appears stalled
 

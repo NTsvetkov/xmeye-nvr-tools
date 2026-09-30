@@ -43,7 +43,9 @@ Launch the desktop GUI after installing the requirements:
 python scripts/nvr_gui.py
 ```
 
-The GUI reads the NVR password from the `XMEYE_PASSWORD` environment variable.
+Enter the NVR password in the masked GUI field, or provide it through the
+`XMEYE_PASSWORD` environment variable. The GUI keeps the password in memory
+for the current session and never saves it in its settings.
 
 ![XMEye NVR Tools search results](docs/images/gui-search-results.png)
 

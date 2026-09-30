@@ -908,7 +908,7 @@ class MainWindow(QMainWindow):
         head.addWidget(self._section("Device"))
         head.addStretch()
         self.password_label = QLabel()
-        self.password_label.setToolTip("Read from the XMEYE_PASSWORD environment variable at start-up")
+        self.password_label.setToolTip("Kept in memory for this GUI session only")
         head.addWidget(self.password_label)
         layout.addLayout(head)
         self.host_edit = QLineEdit(); self.host_edit.setFont(mono_font())
@@ -924,6 +924,11 @@ class MainWindow(QMainWindow):
         layout.addWidget(self._field("Username"))
         self.user_edit = QLineEdit()
         layout.addWidget(self.user_edit)
+        layout.addWidget(self._field("Password"))
+        self.password_edit = QLineEdit()
+        self.password_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self.password_edit.setPlaceholderText("Session only")
+        layout.addWidget(self.password_edit)
         layout.addSpacing(14)
 
         head = QHBoxLayout()
@@ -1194,6 +1199,7 @@ class MainWindow(QMainWindow):
         self.browse_button.clicked.connect(self._browse_output)
         self.host_edit.textChanged.connect(self._update_host_status)
         self.port_spin.valueChanged.connect(self._update_host_status)
+        self.password_edit.textChanged.connect(self._update_password_label)
         self.today_button.clicked.connect(lambda: self._set_day(0))
         self.yesterday_button.clicked.connect(lambda: self._set_day(-1))
         self.last_week_button.clicked.connect(lambda: self._set_last_days(7))
@@ -1227,6 +1233,7 @@ class MainWindow(QMainWindow):
         self.host_edit.setText(self.settings.value("host", "192.168.66.153"))
         self.port_spin.setValue(int(self.settings.value("port", 34567)))
         self.user_edit.setText(self.settings.value("username", "koko"))
+        self.password_edit.setText(os.environ.get("XMEYE_PASSWORD", ""))
         count = int(self.settings.value("camera_count", 8))
         selected = {
             int(value) for value in str(self.settings.value("selected_cameras", "0")).split(",")
@@ -1279,9 +1286,9 @@ class MainWindow(QMainWindow):
         return self.camera_grid.selected()
 
     def _connection_settings(self):
-        password = os.environ.get("XMEYE_PASSWORD", "")
+        password = self.password_edit.text() or os.environ.get("XMEYE_PASSWORD", "")
         if not password:
-            raise ValueError("XMEYE_PASSWORD is not set. Restart the GUI after setting it.")
+            raise ValueError("Enter the NVR password or set XMEYE_PASSWORD.")
         host = self.host_edit.text().strip()
         username = self.user_edit.text().strip()
         if not host or not username:
@@ -1418,8 +1425,10 @@ class MainWindow(QMainWindow):
 
     def _update_password_label(self):
         c = nvr_theme.colors()
-        available = bool(os.environ.get("XMEYE_PASSWORD"))
-        self.password_label.setText("\u25cf Password set" if available else "\u25cf XMEYE_PASSWORD not set")
+        available = bool(
+            self.password_edit.text() or os.environ.get("XMEYE_PASSWORD")
+        )
+        self.password_label.setText("\u25cf Password set" if available else "\u25cf Password required")
         self.password_label.setStyleSheet(
             f"color: {c['green'] if available else c['red']}; font-size: 9pt;"
         )
