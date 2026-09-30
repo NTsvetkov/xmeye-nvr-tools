@@ -1086,7 +1086,7 @@ class MainWindow(QMainWindow):
         self.start_queue_button = make_button("\u25b6  Start queue", primary=True)
         self.start_queue_button.setMinimumWidth(130)
         self.start_queue_button.setToolTip(
-            "Pause starts no new downloads; active downloads and all pending conversions finish"
+            "Pause starts no new downloads or conversions; active work finishes"
         )
         rule = QFrame(); rule.setObjectName("VRule"); rule.setFixedHeight(20)
         self.retry_failed_button = make_button("Retry failed")
@@ -1498,9 +1498,8 @@ class MainWindow(QMainWindow):
                 worker.signals.finished.connect(self._download_finished)
                 worker.signals.failed.connect(self._work_failed)
                 self.download_pool.start(worker)
-        # Pausing only stops new downloads. Already downloaded work, including
-        # files finishing after the pause click, must drain through conversion.
-        self._pump_conversions()
+        if self.queue_running:
+            self._pump_conversions()
         self._update_overall_progress()
         if self.queue_running and not self.active_downloads and not self.active_conversions and not self.waiting_conversion:
             if not any(entry.status == "Queued" for entry in self.queue_entries):
@@ -1859,10 +1858,9 @@ class MainWindow(QMainWindow):
     def _pause_queue(self):
         self.queue_running = False
         self._log(
-            "Queue paused: no new downloads will start; active downloads and "
-            "all pending conversions will finish."
+            "Queue paused: no new downloads or conversions will start; "
+            "active work will finish."
         )
-        self._pump_conversions()
         self._update_overall_progress()
 
     def _apply_pool_limits(self):

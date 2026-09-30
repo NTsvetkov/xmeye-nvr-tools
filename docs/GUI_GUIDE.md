@@ -145,11 +145,13 @@ not redirect work already in the queue.
 
 The queue shows per-recording state, progress, and current download speed.
 
-- **Start queue / Pause queue** controls whether new downloads may start.
-  Pausing does not interrupt active work; already downloaded recordings may
-  continue through conversion.
+- **Start queue / Pause queue** controls whether new downloads or conversions
+  may start. Pausing does not interrupt work that is already active, but
+  waiting conversions remain paused until the queue is started again.
 - **Cancel active** interrupts current socket reads and converter process trees.
   The queue remains enabled, so another queued item may start afterward.
+  To halt everything immediately, pause the queue first and then use
+  **Cancel active**.
 - **Retry failed** returns failed, stopped, or cancelled items to `Queued`.
 - **Clear completed** removes completed rows without deleting their files.
 - **Remove selected** removes inactive rows from the queue.
