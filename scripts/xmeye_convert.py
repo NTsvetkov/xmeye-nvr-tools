@@ -1011,7 +1011,34 @@ def print_analysis(info, segments, end, end_source):
         )
 
 
-def convert(path, output_path, keep_temp, anchor_interval, transition_min, forced_fps):
+def verify_decoding_and_recover(
+    path, ffmpeg, ffprobe, info, segments, temp_dir, concat_path,
+    temporary_output, audio_path,
+):
+    print("\nStrict-decoding the complete fast-path result...")
+    clean, error = decode_video(ffmpeg, temporary_output)
+    if clean:
+        return
+    print("Fast-path decode failed; locating damaged timeline parts...")
+    temporary_output.unlink(missing_ok=True)
+    recover_decoding_segments(
+        path, ffmpeg, ffprobe, info, segments, temp_dir
+    )
+    mux_segments(
+        ffmpeg, info, segments, concat_path, temporary_output, audio_path
+    )
+    clean, error = decode_video(ffmpeg, temporary_output)
+    if not clean:
+        detail = error.splitlines()[0] if error else "unknown decode error"
+        raise RuntimeError(
+            f"Recovered output still fails strict decoding: {detail}"
+        )
+
+
+def convert(
+    path, output_path, keep_temp, anchor_interval, transition_min, forced_fps,
+    verify_decode=True,
+):
     ffmpeg, ffprobe = find_executable("ffmpeg"), find_executable("ffprobe")
     print(f"Input:  {path}\nOutput: {output_path}\n\nInspecting XMEye stream...")
     info = inspect_stream(path)
@@ -1044,23 +1071,16 @@ def convert(path, output_path, keep_temp, anchor_interval, transition_min, force
         mux_segments(
             ffmpeg, info, segments, concat_path, temporary_output, audio_path
         )
-        print("\nStrict-decoding the complete fast-path result...")
-        clean, error = decode_video(ffmpeg, temporary_output)
-        if not clean:
-            print("Fast-path decode failed; locating damaged timeline parts...")
-            temporary_output.unlink(missing_ok=True)
-            recover_decoding_segments(
-                path, ffmpeg, ffprobe, info, segments, temp_dir
+        if verify_decode:
+            verify_decoding_and_recover(
+                path, ffmpeg, ffprobe, info, segments, temp_dir, concat_path,
+                temporary_output, audio_path,
             )
-            mux_segments(
-                ffmpeg, info, segments, concat_path, temporary_output, audio_path
+        else:
+            print(
+                "\nFast mode: skipping the complete video decode and automatic "
+                "GOP recovery."
             )
-            clean, error = decode_video(ffmpeg, temporary_output)
-            if not clean:
-                detail = error.splitlines()[0] if error else "unknown decode error"
-                raise RuntimeError(
-                    f"Recovered output still fails strict decoding: {detail}"
-                )
         print("\nValidating streams, durations, and packet timestamps...")
         duration, video_duration, audio_duration, packets, keys, _ = validate_output(
             ffprobe, temporary_output, info, segments, expected
@@ -1110,6 +1130,11 @@ def main():
                         help="Explicit constant-FPS override for diagnostics/legacy use.")
     parser.add_argument("--real-time", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--keep-temp", action="store_true")
+    parser.add_argument(
+        "--fast", action="store_true",
+        help=("Skip the full video decode and GOP recovery; packet, timestamp, "
+              "duration and audio validation still run."),
+    )
     args = parser.parse_args()
     if args.anchor_interval < MIN_SEGMENT_SECONDS:
         parser.error(f"--anchor-interval must be at least {MIN_SEGMENT_SECONDS:g} seconds.")
@@ -1127,7 +1152,7 @@ def main():
         parser.error("Output must use the .mp4 extension.")
     try:
         convert(path, output, args.keep_temp, args.anchor_interval,
-                args.transition_min_seconds, args.fps)
+                args.transition_min_seconds, args.fps, not args.fast)
     except subprocess.CalledProcessError as exc:
         print(f"\nFFmpeg/ffprobe failed with exit code {exc.returncode}.", file=sys.stderr)
         sys.exit(exc.returncode or 1)

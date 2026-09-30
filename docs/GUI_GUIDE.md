@@ -104,8 +104,18 @@ Runs the timestamp-aware converter after downloading. The converter:
 - preserves the encoded H.264/H.265 video rather than re-encoding it;
 - copies AAC audio when present and converts G.711 A-law audio to AAC;
 - reconstructs monotonic packet timestamps from XMEye FC/GOP timestamps;
-- strict-decodes and validates the complete output before publication;
+- validates packet counts, timestamps, duration, codec, and audio;
 - writes the final MP4 atomically.
+
+**Verify entire video** is enabled by default. It additionally decodes every
+video frame before publication and performs GOP-level recovery if damaged
+encoded video is found. This is the safest mode, but it is CPU-heavy: on the
+tested machine a one-hour H.264 recording needed about 68 seconds for this
+step, while a one-hour HEVC recording needed about 227 seconds.
+
+Disable **Verify entire video** for fast mode. The normal packet, timestamp,
+duration, codec, and audio checks still run, but encoded-frame damage cannot be
+detected automatically. Keep the original `.xmeye` file when using fast mode.
 
 Existing `.mkv` files are left untouched and shown as legacy files. They do
 not count as a completed MP4 conversion, so a retained `.xmeye` source can be
@@ -130,13 +140,13 @@ validated MP4 is the desired final artifact.
 
 - **Parallel downloads** controls simultaneous DVRIP transfers.
 - **Parallel conversions** controls simultaneous FFmpeg processes and defaults
-  to one, because strict HEVC decoding can be CPU intensive.
+  to one, because full HEVC verification can be CPU intensive.
 - **Keep free space** pauses the queue before a new download when free disk
   space falls below the configured percentage.
 
 Each queued item stores a snapshot of its NVR connection, output directory,
-conversion, deletion, and free-space settings. Editing the sidebar later does
-not redirect work already in the queue.
+conversion, verification, deletion, and free-space settings. Editing the
+sidebar later does not redirect work already in the queue.
 
 ## Download queue
 

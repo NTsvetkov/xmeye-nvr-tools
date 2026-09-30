@@ -310,13 +310,17 @@ def _run_converter_process(
     input_path: Path,
     output_path: Path,
     cancel_event: threading.Event,
+    verify_decode: bool,
 ) -> None:
     creation_flags = 0
     if sys.platform == "win32":
         creation_flags = subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP
     error_output = tempfile.TemporaryFile(mode="w+", encoding="utf-8")
+    command = [sys.executable, str(converter), str(input_path), str(output_path)]
+    if not verify_decode:
+        command.append("--fast")
     process = subprocess.Popen(
-        [sys.executable, str(converter), str(input_path), str(output_path)],
+        command,
         stdout=subprocess.DEVNULL,
         stderr=error_output,
         creationflags=creation_flags,
@@ -368,6 +372,7 @@ def convert_recording(
     cancel_event: threading.Event,
     log: LogCallback,
     force: bool = False,
+    verify_decode: bool = True,
 ) -> ConversionOutcome:
     """Convert once, then sanitize structural damage and retry exactly once."""
     _check_cancel(cancel_event)
@@ -377,10 +382,13 @@ def convert_recording(
         log(f"MP4 already exists; skipping conversion: {output_path.name}")
         return ConversionOutcome(output_path, False)
 
-    log(f"Converting to MP4: {output_path.name}")
+    mode = "full verification" if verify_decode else "fast mode"
+    log(f"Converting to MP4 ({mode}): {output_path.name}")
     repaired = False
     try:
-        _run_converter_process(converter, raw_path, output_path, cancel_event)
+        _run_converter_process(
+            converter, raw_path, output_path, cancel_event, verify_decode
+        )
     except ConversionProcessError as first_error:
         repairable = (
             "Unexpected non-frame data" in first_error.details
@@ -401,7 +409,8 @@ def convert_recording(
                 _check_cancel(cancel_event)
                 log("Retrying conversion from the repaired copy...")
                 _run_converter_process(
-                    converter, repaired_path, output_path, cancel_event
+                    converter, repaired_path, output_path, cancel_event,
+                    verify_decode,
                 )
                 repaired = True
         except (CancelledError, InterruptedError):

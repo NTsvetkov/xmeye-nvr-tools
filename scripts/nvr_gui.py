@@ -717,6 +717,7 @@ class QueueEntry:
     output_dir: Path
     convert: bool
     delete_raw: bool
+    verify_decode: bool
     min_free_percent: float
     status: str = "Queued"
     progress: int = 0
@@ -780,6 +781,7 @@ class ConversionWorker(QRunnable):
                 self.entry.cancel_event,
                 self.signals.log.emit,
                 force=self.entry.force_download,
+                verify_decode=self.entry.verify_decode,
             )
             if (
                 self.entry.delete_raw
@@ -961,8 +963,13 @@ class MainWindow(QMainWindow):
 
         layout.addWidget(self._section("Processing"))
         self.convert_check = ToggleSwitch("Convert to MP4")
+        self.verify_decode_check = ToggleSwitch("Verify entire video")
+        self.verify_decode_check.setToolTip(
+            "Disable for faster conversion with packet/timestamp validation only"
+        )
         self.delete_raw_check = ToggleSwitch("Delete raw after conversion")
         layout.addWidget(self.convert_check)
+        layout.addWidget(self.verify_decode_check)
         layout.addWidget(self.delete_raw_check)
         divider = QFrame(); divider.setObjectName("Divider")
         layout.addWidget(divider)
@@ -1195,6 +1202,7 @@ class MainWindow(QMainWindow):
         self.cams_all_button.clicked.connect(lambda: self.camera_grid.set_all(True))
         self.cams_none_button.clicked.connect(lambda: self.camera_grid.set_all(False))
         self.convert_check.toggled.connect(self.delete_raw_check.setEnabled)
+        self.convert_check.toggled.connect(self.verify_decode_check.setEnabled)
         self.output_edit.editingFinished.connect(self._output_changed)
         self.browse_button.clicked.connect(self._browse_output)
         self.host_edit.textChanged.connect(self._update_host_status)
@@ -1244,7 +1252,11 @@ class MainWindow(QMainWindow):
         output = self.settings.value("output_directory", str(PROJECT_ROOT / "downloads"))
         self.output_edit.setText(str(output))
         self.convert_check.setChecked(self.settings.value("convert", False, type=bool))
+        self.verify_decode_check.setChecked(
+            self.settings.value("verify_decode", True, type=bool)
+        )
         self.delete_raw_check.setChecked(self.settings.value("delete_raw", False, type=bool))
+        self.verify_decode_check.setEnabled(self.convert_check.isChecked())
         self.delete_raw_check.setEnabled(self.convert_check.isChecked())
         self.downloads_spin.setValue(int(self.settings.value("concurrent_downloads", 2)))
         self.conversions_spin.setValue(int(self.settings.value("concurrent_conversions", 1)))
@@ -1270,6 +1282,7 @@ class MainWindow(QMainWindow):
         self.settings.setValue("selected_cameras", ",".join(map(str, self._selected_cameras())))
         self.settings.setValue("output_directory", self.output_edit.text().strip())
         self.settings.setValue("convert", self.convert_check.isChecked())
+        self.settings.setValue("verify_decode", self.verify_decode_check.isChecked())
         self.settings.setValue("delete_raw", self.delete_raw_check.isChecked())
         self.settings.setValue("concurrent_downloads", self.downloads_spin.value())
         self.settings.setValue("concurrent_conversions", self.conversions_spin.value())
@@ -1443,7 +1456,8 @@ class MainWindow(QMainWindow):
         self._update_password_label()
         self._update_queue_status()
         for widget in (self.results_table.viewport(), self.queue_table.viewport(),
-                       self.convert_check, self.delete_raw_check):
+                       self.convert_check, self.verify_decode_check,
+                       self.delete_raw_check):
             widget.update()
 
     def _add_selected(self, start_now):
@@ -1457,12 +1471,14 @@ class MainWindow(QMainWindow):
         output_dir = Path(self.output_edit.text()).expanduser()
         convert = self.convert_check.isChecked()
         delete_raw = self.delete_raw_check.isChecked()
+        verify_decode = self.verify_decode_check.isChecked()
         min_free_percent = self.min_free_spin.value()
         existing = {entry.key for entry in self.queue_entries}
         added = 0
         for item in selected:
             entry = QueueEntry(
-                item, settings, output_dir, convert, delete_raw, min_free_percent
+                item, settings, output_dir, convert, delete_raw, verify_decode,
+                min_free_percent,
             )
             if entry.key not in existing:
                 self.queue_entries.append(entry); existing.add(entry.key); added += 1
