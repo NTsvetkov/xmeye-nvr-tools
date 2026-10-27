@@ -670,6 +670,18 @@ class ResultsModel(QAbstractTableModel):
                 [Qt.ItemDataRole.DisplayRole, Qt.ItemDataRole.ForegroundRole],
             )
 
+    def refresh_item_status(self, item: RecordingRef, output_dir: Path):
+        """Refresh one recording's status after work in output_dir finished."""
+        if Path(output_dir) != Path(self.output_dir) or item.key not in self._local_statuses:
+            return
+        self._local_statuses[item.key] = local_status(item, self.output_dir)
+        for row, page_item in enumerate(self._page_items()):
+            if page_item.key == item.key:
+                self.dataChanged.emit(
+                    self.index(row, 6), self.index(row, 6),
+                    [Qt.ItemDataRole.DisplayRole, Qt.ItemDataRole.ForegroundRole],
+                )
+
     def _refresh_local_status_cache(self):
         self._local_statuses = {
             item.key: local_status(item, self.output_dir) for item in self._items
@@ -726,10 +738,12 @@ class QueueEntry:
     cancel_status: str = "Cancelled"
     retry_after_stop: bool = False
     force_download: bool = False
+    key: tuple = field(init=False, repr=False)
 
-    @property
-    def key(self):
-        return (
+    def __post_init__(self):
+        # Computed once: resolve() can change after prepare_download creates
+        # the directory, and the key must stay stable in the active sets.
+        self.key = (
             self.settings.host,
             self.settings.port,
             str(self.output_dir.resolve()),
@@ -1485,12 +1499,15 @@ class MainWindow(QMainWindow):
         self._refresh_queue_table()
         self._log(f"Added {added} recording(s) to the queue; duplicates skipped.")
         if start_now:
+            self.tabs.setCurrentIndex(1)
             self._start_queue()
 
     def _start_queue(self):
         self._save_settings()
         for entry in self.queue_entries:
-            if entry.status in ("Stopped", "Cancelled"):
+            # A user's per-item Stop survives pause/resume; "Retry failed" or
+            # "Download again" re-queues such an item explicitly.
+            if entry.status == "Cancelled":
                 entry.status = "Queued"
                 entry.progress = 0
                 entry.speed = 0
@@ -1550,7 +1567,7 @@ class MainWindow(QMainWindow):
             entry.force_download = False
             entry.status = "Done"
         self._update_queue_row(entry)
-        self.results_model.refresh_local_status(Path(self.output_edit.text()).expanduser())
+        self.results_model.refresh_item_status(entry.item, entry.output_dir)
         self._pump_queue()
 
     def _pump_conversions(self):
@@ -1577,7 +1594,7 @@ class MainWindow(QMainWindow):
         entry.force_download = False
         entry.status = "Done"; entry.progress = 100
         self._update_queue_row(entry)
-        self.results_model.refresh_local_status(Path(self.output_edit.text()).expanduser())
+        self.results_model.refresh_item_status(entry.item, entry.output_dir)
         self._pump_queue()
 
     def _work_failed(self, entry, exc):
@@ -1835,7 +1852,7 @@ class MainWindow(QMainWindow):
         for path in existing:
             path.unlink()
             self._log(f"Deleted local file: {path}")
-        self.results_model.refresh_local_status(Path(self.output_edit.text()).expanduser())
+        self.results_model.refresh_item_status(entry.item, entry.output_dir)
 
     def _remove_queue_entry(self, entry):
         self.queue_entries = [item for item in self.queue_entries if item is not entry]

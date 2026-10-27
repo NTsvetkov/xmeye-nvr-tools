@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -24,6 +25,15 @@ from nvr_fetch import (
 )
 from xmeye_repair import default_output_path, sanitize_file
 
+
+# Structural errors raised by xmeye_convert's frame walk that sanitize_file fixes.
+REPAIRABLE_ERRORS = (
+    "Unexpected non-frame data",
+    "Truncated XMEye frame",
+    "Truncated 16-byte frame header",
+    "Unknown XMEye frame type",
+    "Invalid XMEye frame header",
+)
 
 LogCallback = Callable[[str], None]
 ProgressCallback = Callable[[int, int, float], None]
@@ -315,17 +325,29 @@ def _run_converter_process(
     creation_flags = 0
     if sys.platform == "win32":
         creation_flags = subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    # Own the converter's work directory: a cancelled converter is killed and
+    # cannot clean up after itself.
+    work_dir = Path(tempfile.mkdtemp(prefix="xmeye_convert_", dir=output_path.parent))
     error_output = tempfile.TemporaryFile(mode="w+", encoding="utf-8")
-    command = [sys.executable, str(converter), str(input_path), str(output_path)]
+    command = [
+        sys.executable, str(converter), str(input_path), str(output_path),
+        "--work-dir", str(work_dir),
+    ]
     if not verify_decode:
         command.append("--fast")
-    process = subprocess.Popen(
-        command,
-        stdout=subprocess.DEVNULL,
-        stderr=error_output,
-        creationflags=creation_flags,
-        start_new_session=sys.platform != "win32",
-    )
+    try:
+        process = subprocess.Popen(
+            command,
+            stdout=subprocess.DEVNULL,
+            stderr=error_output,
+            creationflags=creation_flags,
+            start_new_session=sys.platform != "win32",
+        )
+    except BaseException:
+        error_output.close()
+        _remove_work_dir(work_dir)
+        raise
 
     def terminate_process_tree() -> None:
         if process.poll() is not None:
@@ -365,6 +387,16 @@ def _run_converter_process(
         if process.poll() is None:
             terminate_process_tree()
         error_output.close()
+        _remove_work_dir(work_dir)
+
+
+def _remove_work_dir(work_dir: Path) -> None:
+    # Windows can keep files locked briefly after the process tree is killed.
+    for attempt in range(5):
+        shutil.rmtree(work_dir, ignore_errors=True)
+        if not work_dir.exists():
+            return
+        time.sleep(0.2 * (attempt + 1))
 
 
 def convert_recording(
@@ -390,9 +422,8 @@ def convert_recording(
             converter, raw_path, output_path, cancel_event, verify_decode
         )
     except ConversionProcessError as first_error:
-        repairable = (
-            "Unexpected non-frame data" in first_error.details
-            or "Truncated XMEye frame" in first_error.details
+        repairable = any(
+            marker in first_error.details for marker in REPAIRABLE_ERRORS
         )
         if not repairable:
             raise
