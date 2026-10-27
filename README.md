@@ -1,5 +1,14 @@
 # XMEye NVR/DVR — standalone tools
 
+English | [Български](README.bg.md)
+
+For a Windows portable build, extract the entire ZIP and run `XMEyeNVR.exe`
+inside the `XMEyeNVR` folder. Keep `XMEyeConvert.exe`, `bin/` and `_internal/`
+beside it. The portable package includes Python, Qt, FFmpeg and ffprobe;
+no Python installation or PATH setup is needed. Keep the folder in a writable
+location. Preferences use your Windows user profile; passwords stay in memory.
+Build instructions are in [packaging/windows/README.md](packaging/windows/README.md).
+
 Standalone Python scripts for talking directly to NVR/DVR devices on the
 XMEye firmware family (also known as NetSurveillance, Sofia, or DVRIP — TCP
 port 34567), outside of Home Assistant. Recon tools, live monitoring, and

@@ -633,7 +633,7 @@ def extract_audio(path, info, temp_dir):
 
 def write_concat(path, segments, use_mkv=False):
     """Write the concat list and return seconds of dropped video before it starts."""
-    with path.open("w", encoding="ascii", newline="\n") as output:
+    with path.open("w", encoding="utf-8", newline="\n") as output:
         output.write("ffconcat version 1.0\n")
         entries = []
         leading = dropped = 0.0
@@ -668,6 +668,11 @@ def write_concat(path, segments, use_mkv=False):
 
 
 def find_executable(name):
+    if getattr(sys, "frozen", False):
+        bundled = Path(sys.executable).resolve().parent / "bin" / f"{name}.exe"
+        if not bundled.is_file():
+            raise RuntimeError(f"Bundled tool not found: {bundled}")
+        return str(bundled)
     path = shutil.which(name)
     if not path:
         raise RuntimeError(f"{name!r} was not found in PATH.")

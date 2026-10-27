@@ -17,6 +17,7 @@ from PySide6.QtCore import (
     QDateTime,
     QModelIndex,
     QObject,
+    QProcess,
     QRectF,
     QRunnable,
     QSettings,
@@ -24,10 +25,13 @@ from PySide6.QtCore import (
     QThreadPool,
     QTime,
     QTimer,
+    QUrl,
     Qt,
     Signal,
 )
-from PySide6.QtGui import QAction, QActionGroup, QColor, QFont, QPainter, QTextCharFormat
+from PySide6.QtGui import (
+    QAction, QActionGroup, QColor, QDesktopServices, QFont, QPainter, QTextCharFormat,
+)
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QAbstractSpinBox,
@@ -88,7 +92,11 @@ from nvr_backend import (
 from nvr_fetch import format_duration
 
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
+PROJECT_ROOT = (
+    Path(sys.executable).resolve().parent
+    if getattr(sys, "frozen", False)
+    else Path(__file__).resolve().parents[1]
+)
 
 
 def qt_datetime(value: QDateTime) -> datetime:
@@ -1760,12 +1768,26 @@ class MainWindow(QMainWindow):
         self.queue_table.selectRow(row)
         entry = self.queue_entries[row]
         menu = QMenu(self)
+        open_video = menu.addAction("Open video")
+        show_folder = menu.addAction("Show in folder")
+        menu.addSeparator()
         download_again = menu.addAction("Download again")
         stop = menu.addAction("Stop")
         delete_local = menu.addAction("Delete local file")
         menu.addSeparator()
         remove = menu.addAction("Remove from queue")
         paths = local_paths(entry.item, entry.output_dir)
+        video_path = next(
+            (path for path in (paths.mp4, paths.legacy_mkv) if path.is_file()),
+            None,
+        )
+        local_path = video_path or next(
+            (path for path in (paths.raw, paths.raw.with_suffix(".xmeye.part"))
+             if path.is_file()),
+            entry.output_dir,
+        )
+        open_video.setEnabled(video_path is not None)
+        show_folder.setEnabled(local_path.exists())
         active = (
             entry.key in self.active_downloads
             or entry.key in self.active_conversions
@@ -1784,7 +1806,11 @@ class MainWindow(QMainWindow):
             not active
         )
         chosen = menu.exec(self.queue_table.viewport().mapToGlobal(position))
-        if chosen == download_again:
+        if chosen == open_video:
+            self._open_local_video(video_path)
+        elif chosen == show_folder:
+            self._show_local_folder(local_path)
+        elif chosen == download_again:
             self._download_again(entry)
         elif chosen == stop:
             self._stop_entry(entry)
@@ -1792,6 +1818,28 @@ class MainWindow(QMainWindow):
             self._delete_local_files(entry)
         elif chosen == remove:
             self._remove_queue_entry(entry)
+
+    def _open_local_video(self, path):
+        if path is None or not path.is_file():
+            QMessageBox.information(self, "File unavailable", "The video file is no longer available.")
+            return
+        if not QDesktopServices.openUrl(QUrl.fromLocalFile(str(path.resolve()))):
+            QMessageBox.warning(self, "Cannot open video", "Windows could not open the video. Check the default video player.")
+
+    def _show_local_folder(self, path):
+        if not path.exists():
+            QMessageBox.information(self, "File unavailable", "The file or folder is no longer available.")
+            return
+        if path.is_file() and sys.platform == "win32":
+            windows = Path(os.environ.get("SystemRoot", "C:/Windows"))
+            started, _ = QProcess.startDetached(
+                str(windows / "explorer.exe"), ["/select,", str(path.resolve())],
+            )
+        else:
+            folder = path if path.is_dir() else path.parent
+            started = QDesktopServices.openUrl(QUrl.fromLocalFile(str(folder.resolve())))
+        if not started:
+            QMessageBox.warning(self, "Cannot open folder", "The file manager could not be opened.")
 
     def _download_again(self, entry):
         entry.force_download = True

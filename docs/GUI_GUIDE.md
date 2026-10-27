@@ -1,5 +1,7 @@
 # Desktop GUI guide
 
+English | [Български](GUI_GUIDE.bg.md)
+
 `nvr_gui.py` is a Windows-friendly desktop front end for searching XMEye NVR
 archives, downloading recordings, repairing damaged record streams, and
 converting them to validated MP4 files.
@@ -15,6 +17,16 @@ thread.
 > paths. No real credentials or recordings are included.
 
 ## Install and launch
+
+### Windows portable package
+
+On Windows 10 (1809 or later) / Windows 11 x64, extract the entire portable
+ZIP to a writable folder and run `XMEyeNVR.exe`. Keep `XMEyeConvert.exe`, `bin/`
+and `_internal/` beside it. Python, Qt, FFmpeg and ffprobe are included; no
+separate installation or PATH setup is required. The GUI remains in English.
+Preferences use your Windows user profile; the password is session-only.
+
+The following installation steps apply when running from Python source.
 
 Requirements:
 
@@ -80,6 +92,9 @@ field for that session.
    **Last 7 days**.
 5. Select **Search**. The same button cancels an active search.
 6. Select recordings and use **Add to queue** or **Download now**.
+
+**Download now** starts the queue and switches to **Download queue**.
+**Add to queue** leaves you on **Search results**.
 
 ![Search results with local-file state](images/gui-search-results.png)
 
@@ -167,6 +182,11 @@ The queue shows per-recording state, progress, and current download speed.
 
 Right-click a queue row for:
 
+- **Open video** — open its MP4 (or legacy MKV) in the default video player;
+  available only when a local video exists;
+- **Show in folder** — open its location and select the file in Windows
+  Explorer; also works with a raw or incomplete download, and opens the output
+  folder if no local file exists yet;
 - **Download again** — force a fresh download for that recording;
 - **Stop** — stop a queued, downloading, or converting item;
 - **Delete local file** — explicitly delete its local raw, MP4, and/or legacy
