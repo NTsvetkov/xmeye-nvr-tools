@@ -330,10 +330,12 @@ def _run_converter_process(
     # cannot clean up after itself.
     work_dir = Path(tempfile.mkdtemp(prefix="xmeye_convert_", dir=output_path.parent))
     error_output = tempfile.TemporaryFile(mode="w+", encoding="utf-8")
-    command = [
-        sys.executable, str(converter), str(input_path), str(output_path),
-        "--work-dir", str(work_dir),
+    command = [str(converter)] if getattr(sys, "frozen", False) else [
+        sys.executable, str(converter),
     ]
+    command.extend([
+        str(input_path), str(output_path), "--work-dir", str(work_dir),
+    ])
     if not verify_decode:
         command.append("--fast")
     try:
@@ -408,7 +410,13 @@ def convert_recording(
 ) -> ConversionOutcome:
     """Convert once, then sanitize structural damage and retry exactly once."""
     _check_cancel(cancel_event)
-    converter = Path(__file__).with_name("xmeye_convert.py")
+    converter = (
+        Path(sys.executable).with_name("XMEyeConvert.exe")
+        if getattr(sys, "frozen", False)
+        else Path(__file__).with_name("xmeye_convert.py")
+    )
+    if not converter.is_file():
+        raise RuntimeError(f"Converter not found: {converter}")
     output_path = raw_path.with_suffix(".mp4")
     if output_path.is_file() and not force:
         log(f"MP4 already exists; skipping conversion: {output_path.name}")

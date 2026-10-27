@@ -20,3 +20,8 @@ samples/
 test-converted_work/
 scripts/__pycache__/
 *.pyc
+
+# Windows portable builds
+.venv-build/
+build/
+dist/
