@@ -220,6 +220,9 @@ class XMEyeRecordSanitizer:
         self._gap_offset: int | None = None
         self._gap_size = 0
         self._gap_preview = bytearray()
+        # Buffer offset of an unconfirmed resync marker. Every offset before
+        # it is already known to be invalid, so later feeds re-probe only it.
+        self._pending_resync: int | None = None
 
     def feed(self, chunk: bytes) -> None:
         if not chunk:
@@ -245,6 +248,7 @@ class XMEyeRecordSanitizer:
         while self.buffer:
             size, state = record_size(self.buffer)
             if state == "complete":
+                self._pending_resync = None
                 self._close_gap()
                 self.output.write(self.buffer[:size])
                 del self.buffer[:size]
@@ -273,24 +277,26 @@ class XMEyeRecordSanitizer:
                 return
 
     def _find_resync(self, eof: bool) -> tuple[int | None, int | None]:
-        search = 1
+        search = self._pending_resync or 1
         pending: int | None = None
         while search < len(self.buffer):
-            hits = [
-                self.buffer.find(marker, search)
-                for marker in KNOWN_MARKERS
-            ]
-            hits = [hit for hit in hits if hit >= 0]
-            if not hits:
+            # One scan for the shared prefix: searching for each marker
+            # separately rescans the whole buffer for every absent marker.
+            candidate = self.buffer.find(MAGIC_PREFIX, search)
+            if candidate < 0 or candidate + 4 > len(self.buffer):
                 break
-            candidate = min(hits)
+            if self.buffer[candidate:candidate + 4] not in KNOWN_MARKERS:
+                search = candidate + 1
+                continue
             verdict = self._probe_candidate(candidate, eof)
             if verdict == "valid":
+                self._pending_resync = None
                 return candidate, None
             if verdict == "pending":
                 pending = candidate
                 break
             search = candidate + 1
+        self._pending_resync = pending
         return None, pending
 
     def _probe_candidate(self, pos: int, eof: bool) -> str:
@@ -312,6 +318,7 @@ class XMEyeRecordSanitizer:
     def _discard_bad(self, count: int) -> None:
         if count <= 0:
             return
+        self._pending_resync = None
         if self._gap_offset is None:
             self._gap_offset = self.buffer_offset
         take = min(16 - len(self._gap_preview), count)

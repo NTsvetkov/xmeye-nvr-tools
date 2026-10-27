@@ -43,12 +43,17 @@ Launch the desktop GUI after installing the requirements:
 python scripts/nvr_gui.py
 ```
 
-The GUI reads the NVR password from the `XMEYE_PASSWORD` environment variable.
+Enter the NVR password in the masked GUI field, or provide it through the
+`XMEYE_PASSWORD` environment variable. The GUI keeps the password in memory
+for the current session and never saves it in its settings.
 
 ![XMEye NVR Tools search results](docs/images/gui-search-results.png)
 
 See the **[desktop GUI guide](docs/GUI_GUIDE.md)** for installation, search,
 download queue, conversion, cancellation, repair, and file-retention details.
+
+The GUI offers optional full-frame verification. Disable it for much faster
+packet/timestamp-validated conversion, while retaining the original `.xmeye`.
 
 - **New/unknown device?** Run `identify_nvr.py` first (port scan + login +
   device info), then `rtsp_probe.py` to find a working RTSP URL.

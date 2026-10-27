@@ -63,14 +63,13 @@ From PowerShell in the repository directory:
 
 ```powershell
 python -m pip install -r requirements.txt
-$env:XMEYE_PASSWORD = "your NVR password"
 python scripts\nvr_gui.py
 ```
 
-The password is read from `XMEYE_PASSWORD` when an operation starts. It is not
-saved in `QSettings` and is never displayed in the interface. Restart the GUI
-after setting the variable if it was launched from a process that did not
-inherit it.
+Enter the password in the masked **Password** field. It remains in memory for
+the current GUI session and is not saved in `QSettings`. You may instead set
+`XMEYE_PASSWORD` before launching the GUI; its value pre-fills the same masked
+field for that session.
 
 ## Search recordings
 
@@ -105,8 +104,18 @@ Runs the timestamp-aware converter after downloading. The converter:
 - preserves the encoded H.264/H.265 video rather than re-encoding it;
 - copies AAC audio when present and converts G.711 A-law audio to AAC;
 - reconstructs monotonic packet timestamps from XMEye FC/GOP timestamps;
-- strict-decodes and validates the complete output before publication;
+- validates packet counts, timestamps, duration, codec, and audio;
 - writes the final MP4 atomically.
+
+**Verify entire video** is enabled by default. It additionally decodes every
+video frame before publication and performs GOP-level recovery if damaged
+encoded video is found. This is the safest mode, but it is CPU-heavy: on the
+tested machine a one-hour H.264 recording needed about 68 seconds for this
+step, while a one-hour HEVC recording needed about 227 seconds.
+
+Disable **Verify entire video** for fast mode. The normal packet, timestamp,
+duration, codec, and audio checks still run, but encoded-frame damage cannot be
+detected automatically. Keep the original `.xmeye` file when using fast mode.
 
 Existing `.mkv` files are left untouched and shown as legacy files. They do
 not count as a completed MP4 conversion, so a retained `.xmeye` source can be
@@ -131,13 +140,13 @@ validated MP4 is the desired final artifact.
 
 - **Parallel downloads** controls simultaneous DVRIP transfers.
 - **Parallel conversions** controls simultaneous FFmpeg processes and defaults
-  to one, because strict HEVC decoding can be CPU intensive.
+  to one, because full HEVC verification can be CPU intensive.
 - **Keep free space** pauses the queue before a new download when free disk
   space falls below the configured percentage.
 
 Each queued item stores a snapshot of its NVR connection, output directory,
-conversion, deletion, and free-space settings. Editing the sidebar later does
-not redirect work already in the queue.
+conversion, verification, deletion, and free-space settings. Editing the
+sidebar later does not redirect work already in the queue.
 
 ## Download queue
 
@@ -145,11 +154,13 @@ not redirect work already in the queue.
 
 The queue shows per-recording state, progress, and current download speed.
 
-- **Start queue / Pause queue** controls whether new downloads may start.
-  Pausing does not interrupt active work; already downloaded recordings may
-  continue through conversion.
+- **Start queue / Pause queue** controls whether new downloads or conversions
+  may start. Pausing does not interrupt work that is already active, but
+  waiting conversions remain paused until the queue is started again.
 - **Cancel active** interrupts current socket reads and converter process trees.
   The queue remains enabled, so another queued item may start afterward.
+  To halt everything immediately, pause the queue first and then use
+  **Cancel active**.
 - **Retry failed** returns failed, stopped, or cancelled items to `Queued`.
 - **Clear completed** removes completed rows without deleting their files.
 - **Remove selected** removes inactive rows from the queue.
@@ -204,14 +215,10 @@ repair attempt when it encounters recognized structural damage.
 
 ## Troubleshooting
 
-### `XMEYE_PASSWORD is not set`
+### The GUI reports `Password required`
 
-Set the variable in the same PowerShell session before starting the GUI:
-
-```powershell
-$env:XMEYE_PASSWORD = "your NVR password"
-python scripts\nvr_gui.py
-```
+Enter the password in the masked sidebar field, or set `XMEYE_PASSWORD` before
+launching the GUI. The password is intentionally not retained after exit.
 
 ### A download appears stalled
 

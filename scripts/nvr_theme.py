@@ -171,9 +171,9 @@ QFrame#VRule {{ background: {c['divider']}; max-width: 1px; min-width: 1px; bord
 QTabWidget::pane {{ border: none; border-top: 1px solid {c['divider']}; background: {c['window']}; }}
 QTabWidget::tab-bar {{ left: 12px; }}
 QTabBar {{ background: {c['window']}; }}
-QTabBar::tab {{ background: transparent; color: {c['muted']}; padding: 11px 14px; border: none; border-bottom: 2px solid transparent; font-weight: 500; }}
-QTabBar::tab:selected {{ color: {c['text']}; border-bottom-color: {c['accent']}; }}
-QTabBar::tab:hover:!selected {{ color: {c['text2']}; }}
+QTabBar::tab {{ background: {c['button']}; color: {c['muted']}; padding: 10px 14px; margin: 6px 6px 4px 0; border: 1px solid {c['border']}; border-bottom: 2px solid {c['border']}; border-radius: 6px; font-weight: 500; }}
+QTabBar::tab:selected {{ background: {c['accent_soft']}; color: {c['accent_soft_fg']}; border-color: {c['accent']}; }}
+QTabBar::tab:hover:!selected {{ background: {c['hover']}; color: {c['text2']}; border-color: {c['muted']}; }}
 
 QTableView {{
     background: {c['window']}; border: none; gridline-color: transparent; outline: none;

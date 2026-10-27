@@ -670,6 +670,18 @@ class ResultsModel(QAbstractTableModel):
                 [Qt.ItemDataRole.DisplayRole, Qt.ItemDataRole.ForegroundRole],
             )
 
+    def refresh_item_status(self, item: RecordingRef, output_dir: Path):
+        """Refresh one recording's status after work in output_dir finished."""
+        if Path(output_dir) != Path(self.output_dir) or item.key not in self._local_statuses:
+            return
+        self._local_statuses[item.key] = local_status(item, self.output_dir)
+        for row, page_item in enumerate(self._page_items()):
+            if page_item.key == item.key:
+                self.dataChanged.emit(
+                    self.index(row, 6), self.index(row, 6),
+                    [Qt.ItemDataRole.DisplayRole, Qt.ItemDataRole.ForegroundRole],
+                )
+
     def _refresh_local_status_cache(self):
         self._local_statuses = {
             item.key: local_status(item, self.output_dir) for item in self._items
@@ -717,6 +729,7 @@ class QueueEntry:
     output_dir: Path
     convert: bool
     delete_raw: bool
+    verify_decode: bool
     min_free_percent: float
     status: str = "Queued"
     progress: int = 0
@@ -725,10 +738,12 @@ class QueueEntry:
     cancel_status: str = "Cancelled"
     retry_after_stop: bool = False
     force_download: bool = False
+    key: tuple = field(init=False, repr=False)
 
-    @property
-    def key(self):
-        return (
+    def __post_init__(self):
+        # Computed once: resolve() can change after prepare_download creates
+        # the directory, and the key must stay stable in the active sets.
+        self.key = (
             self.settings.host,
             self.settings.port,
             str(self.output_dir.resolve()),
@@ -780,6 +795,7 @@ class ConversionWorker(QRunnable):
                 self.entry.cancel_event,
                 self.signals.log.emit,
                 force=self.entry.force_download,
+                verify_decode=self.entry.verify_decode,
             )
             if (
                 self.entry.delete_raw
@@ -908,7 +924,7 @@ class MainWindow(QMainWindow):
         head.addWidget(self._section("Device"))
         head.addStretch()
         self.password_label = QLabel()
-        self.password_label.setToolTip("Read from the XMEYE_PASSWORD environment variable at start-up")
+        self.password_label.setToolTip("Kept in memory for this GUI session only")
         head.addWidget(self.password_label)
         layout.addLayout(head)
         self.host_edit = QLineEdit(); self.host_edit.setFont(mono_font())
@@ -924,6 +940,11 @@ class MainWindow(QMainWindow):
         layout.addWidget(self._field("Username"))
         self.user_edit = QLineEdit()
         layout.addWidget(self.user_edit)
+        layout.addWidget(self._field("Password"))
+        self.password_edit = QLineEdit()
+        self.password_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self.password_edit.setPlaceholderText("Session only")
+        layout.addWidget(self.password_edit)
         layout.addSpacing(14)
 
         head = QHBoxLayout()
@@ -956,8 +977,13 @@ class MainWindow(QMainWindow):
 
         layout.addWidget(self._section("Processing"))
         self.convert_check = ToggleSwitch("Convert to MP4")
+        self.verify_decode_check = ToggleSwitch("Verify entire video")
+        self.verify_decode_check.setToolTip(
+            "Disable for faster conversion with packet/timestamp validation only"
+        )
         self.delete_raw_check = ToggleSwitch("Delete raw after conversion")
         layout.addWidget(self.convert_check)
+        layout.addWidget(self.verify_decode_check)
         layout.addWidget(self.delete_raw_check)
         divider = QFrame(); divider.setObjectName("Divider")
         layout.addWidget(divider)
@@ -1086,7 +1112,7 @@ class MainWindow(QMainWindow):
         self.start_queue_button = make_button("\u25b6  Start queue", primary=True)
         self.start_queue_button.setMinimumWidth(130)
         self.start_queue_button.setToolTip(
-            "Pause starts no new downloads; active downloads and all pending conversions finish"
+            "Pause starts no new downloads or conversions; active work finishes"
         )
         rule = QFrame(); rule.setObjectName("VRule"); rule.setFixedHeight(20)
         self.retry_failed_button = make_button("Retry failed")
@@ -1190,10 +1216,12 @@ class MainWindow(QMainWindow):
         self.cams_all_button.clicked.connect(lambda: self.camera_grid.set_all(True))
         self.cams_none_button.clicked.connect(lambda: self.camera_grid.set_all(False))
         self.convert_check.toggled.connect(self.delete_raw_check.setEnabled)
+        self.convert_check.toggled.connect(self.verify_decode_check.setEnabled)
         self.output_edit.editingFinished.connect(self._output_changed)
         self.browse_button.clicked.connect(self._browse_output)
         self.host_edit.textChanged.connect(self._update_host_status)
         self.port_spin.valueChanged.connect(self._update_host_status)
+        self.password_edit.textChanged.connect(self._update_password_label)
         self.today_button.clicked.connect(lambda: self._set_day(0))
         self.yesterday_button.clicked.connect(lambda: self._set_day(-1))
         self.last_week_button.clicked.connect(lambda: self._set_last_days(7))
@@ -1227,6 +1255,7 @@ class MainWindow(QMainWindow):
         self.host_edit.setText(self.settings.value("host", "192.168.66.153"))
         self.port_spin.setValue(int(self.settings.value("port", 34567)))
         self.user_edit.setText(self.settings.value("username", "koko"))
+        self.password_edit.setText(os.environ.get("XMEYE_PASSWORD", ""))
         count = int(self.settings.value("camera_count", 8))
         selected = {
             int(value) for value in str(self.settings.value("selected_cameras", "0")).split(",")
@@ -1237,7 +1266,11 @@ class MainWindow(QMainWindow):
         output = self.settings.value("output_directory", str(PROJECT_ROOT / "downloads"))
         self.output_edit.setText(str(output))
         self.convert_check.setChecked(self.settings.value("convert", False, type=bool))
+        self.verify_decode_check.setChecked(
+            self.settings.value("verify_decode", True, type=bool)
+        )
         self.delete_raw_check.setChecked(self.settings.value("delete_raw", False, type=bool))
+        self.verify_decode_check.setEnabled(self.convert_check.isChecked())
         self.delete_raw_check.setEnabled(self.convert_check.isChecked())
         self.downloads_spin.setValue(int(self.settings.value("concurrent_downloads", 2)))
         self.conversions_spin.setValue(int(self.settings.value("concurrent_conversions", 1)))
@@ -1263,6 +1296,7 @@ class MainWindow(QMainWindow):
         self.settings.setValue("selected_cameras", ",".join(map(str, self._selected_cameras())))
         self.settings.setValue("output_directory", self.output_edit.text().strip())
         self.settings.setValue("convert", self.convert_check.isChecked())
+        self.settings.setValue("verify_decode", self.verify_decode_check.isChecked())
         self.settings.setValue("delete_raw", self.delete_raw_check.isChecked())
         self.settings.setValue("concurrent_downloads", self.downloads_spin.value())
         self.settings.setValue("concurrent_conversions", self.conversions_spin.value())
@@ -1279,9 +1313,9 @@ class MainWindow(QMainWindow):
         return self.camera_grid.selected()
 
     def _connection_settings(self):
-        password = os.environ.get("XMEYE_PASSWORD", "")
+        password = self.password_edit.text() or os.environ.get("XMEYE_PASSWORD", "")
         if not password:
-            raise ValueError("XMEYE_PASSWORD is not set. Restart the GUI after setting it.")
+            raise ValueError("Enter the NVR password or set XMEYE_PASSWORD.")
         host = self.host_edit.text().strip()
         username = self.user_edit.text().strip()
         if not host or not username:
@@ -1418,8 +1452,10 @@ class MainWindow(QMainWindow):
 
     def _update_password_label(self):
         c = nvr_theme.colors()
-        available = bool(os.environ.get("XMEYE_PASSWORD"))
-        self.password_label.setText("\u25cf Password set" if available else "\u25cf XMEYE_PASSWORD not set")
+        available = bool(
+            self.password_edit.text() or os.environ.get("XMEYE_PASSWORD")
+        )
+        self.password_label.setText("\u25cf Password set" if available else "\u25cf Password required")
         self.password_label.setStyleSheet(
             f"color: {c['green'] if available else c['red']}; font-size: 9pt;"
         )
@@ -1434,7 +1470,8 @@ class MainWindow(QMainWindow):
         self._update_password_label()
         self._update_queue_status()
         for widget in (self.results_table.viewport(), self.queue_table.viewport(),
-                       self.convert_check, self.delete_raw_check):
+                       self.convert_check, self.verify_decode_check,
+                       self.delete_raw_check):
             widget.update()
 
     def _add_selected(self, start_now):
@@ -1448,24 +1485,29 @@ class MainWindow(QMainWindow):
         output_dir = Path(self.output_edit.text()).expanduser()
         convert = self.convert_check.isChecked()
         delete_raw = self.delete_raw_check.isChecked()
+        verify_decode = self.verify_decode_check.isChecked()
         min_free_percent = self.min_free_spin.value()
         existing = {entry.key for entry in self.queue_entries}
         added = 0
         for item in selected:
             entry = QueueEntry(
-                item, settings, output_dir, convert, delete_raw, min_free_percent
+                item, settings, output_dir, convert, delete_raw, verify_decode,
+                min_free_percent,
             )
             if entry.key not in existing:
                 self.queue_entries.append(entry); existing.add(entry.key); added += 1
         self._refresh_queue_table()
         self._log(f"Added {added} recording(s) to the queue; duplicates skipped.")
         if start_now:
+            self.tabs.setCurrentIndex(1)
             self._start_queue()
 
     def _start_queue(self):
         self._save_settings()
         for entry in self.queue_entries:
-            if entry.status in ("Stopped", "Cancelled"):
+            # A user's per-item Stop survives pause/resume; "Retry failed" or
+            # "Download again" re-queues such an item explicitly.
+            if entry.status == "Cancelled":
                 entry.status = "Queued"
                 entry.progress = 0
                 entry.speed = 0
@@ -1498,9 +1540,8 @@ class MainWindow(QMainWindow):
                 worker.signals.finished.connect(self._download_finished)
                 worker.signals.failed.connect(self._work_failed)
                 self.download_pool.start(worker)
-        # Pausing only stops new downloads. Already downloaded work, including
-        # files finishing after the pause click, must drain through conversion.
-        self._pump_conversions()
+        if self.queue_running:
+            self._pump_conversions()
         self._update_overall_progress()
         if self.queue_running and not self.active_downloads and not self.active_conversions and not self.waiting_conversion:
             if not any(entry.status == "Queued" for entry in self.queue_entries):
@@ -1526,7 +1567,7 @@ class MainWindow(QMainWindow):
             entry.force_download = False
             entry.status = "Done"
         self._update_queue_row(entry)
-        self.results_model.refresh_local_status(Path(self.output_edit.text()).expanduser())
+        self.results_model.refresh_item_status(entry.item, entry.output_dir)
         self._pump_queue()
 
     def _pump_conversions(self):
@@ -1553,7 +1594,7 @@ class MainWindow(QMainWindow):
         entry.force_download = False
         entry.status = "Done"; entry.progress = 100
         self._update_queue_row(entry)
-        self.results_model.refresh_local_status(Path(self.output_edit.text()).expanduser())
+        self.results_model.refresh_item_status(entry.item, entry.output_dir)
         self._pump_queue()
 
     def _work_failed(self, entry, exc):
@@ -1811,7 +1852,7 @@ class MainWindow(QMainWindow):
         for path in existing:
             path.unlink()
             self._log(f"Deleted local file: {path}")
-        self.results_model.refresh_local_status(Path(self.output_edit.text()).expanduser())
+        self.results_model.refresh_item_status(entry.item, entry.output_dir)
 
     def _remove_queue_entry(self, entry):
         self.queue_entries = [item for item in self.queue_entries if item is not entry]
@@ -1859,10 +1900,9 @@ class MainWindow(QMainWindow):
     def _pause_queue(self):
         self.queue_running = False
         self._log(
-            "Queue paused: no new downloads will start; active downloads and "
-            "all pending conversions will finish."
+            "Queue paused: no new downloads or conversions will start; "
+            "active work will finish."
         )
-        self._pump_conversions()
         self._update_overall_progress()
 
     def _apply_pool_limits(self):

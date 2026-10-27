@@ -28,6 +28,10 @@ MAX_KEYFRAME_GAP = 30.0
 MIN_SEGMENT_SECONDS = 5.0
 
 
+class PacketCountMismatch(RuntimeError):
+    pass
+
+
 @dataclass
 class Keyframe:
     number: int
@@ -429,6 +433,44 @@ def stable_mode_boundaries(keyframes, minimum):
     return result
 
 
+def segment_end_before_gap(info, start_index, end_index):
+    """Estimate when the last GOP before a recorder pause actually ended."""
+    first = info.keyframes[start_index]
+    last = info.keyframes[end_index - 1]
+    last_gop_frames = info.keyframes[end_index].frame_index - last.frame_index
+    span = (last.timestamp - first.timestamp).total_seconds()
+    if span > 0:
+        rate = (last.frame_index - first.frame_index) / span
+        return last.timestamp + timedelta(seconds=last_gop_frames / rate)
+    # A single GOP has no local rate measurement. Borrow the nearest measured
+    # rate in the same mode, not its GOP duration: GOPs can have different sizes.
+    rates = []
+    for index, (a, b) in enumerate(zip(info.keyframes, info.keyframes[1:])):
+        gap = (b.timestamp - a.timestamp).total_seconds()
+        if a.mode != last.mode or not 0 < gap <= MAX_KEYFRAME_GAP:
+            continue
+        rate = (b.frame_index - a.frame_index) / gap
+        if 0.1 <= rate <= 120:
+            rates.append((abs(index - (end_index - 1)), rate))
+    if not rates:
+        raise RuntimeError(
+            "Cannot infer the frame rate before a recorder pause; "
+            "use --fps to specify a known constant frame rate."
+        )
+    _, rate = min(rates)
+    return last.timestamp + timedelta(seconds=last_gop_frames / rate)
+
+
+def dropped_edge_durations(segments):
+    """Return seconds of fully dropped video before the first and after the last kept part."""
+    kept = [index for index, segment in enumerate(segments) if not segment.fully_dropped]
+    if not kept:
+        return 0.0, 0.0
+    leading = sum(segment.duration for segment in segments[:kept[0]])
+    trailing = sum(segment.duration for segment in segments[kept[-1] + 1:])
+    return leading, trailing
+
+
 def build_timeline(path, info, anchor_interval, transition_min, forced_fps):
     first = info.keyframes[0].timestamp
     if forced_fps is not None:
@@ -473,20 +515,33 @@ def build_timeline(path, info, anchor_interval, transition_min, forced_fps):
                 if keyframe.timestamp > info.keyframes[boundaries[-1]].timestamp:
                     boundaries.append(index)
                     last_time = keyframe.timestamp
-        if len(boundaries) > 1 and (
-            end - info.keyframes[boundaries[-1]].timestamp
-        ).total_seconds() < MIN_SEGMENT_SECONDS:
+        if (
+            len(boundaries) > 1
+            and boundaries[-1] not in discontinuities
+            and (end - info.keyframes[boundaries[-1]].timestamp).total_seconds()
+            < MIN_SEGMENT_SECONDS
+        ):
             boundaries.pop()
 
+    if forced_fps is not None:
+        discontinuities = set()
     segments = []
     for number, start_index in enumerate(boundaries):
         end_index = boundaries[number + 1] if number + 1 < len(boundaries) else len(info.keyframes)
         start_frame = info.keyframes[start_index].frame_index
         end_frame = info.keyframes[end_index].frame_index if end_index < len(info.keyframes) else info.video_frames
+        if end_index >= len(info.keyframes):
+            segment_end = end
+        elif end_index in discontinuities:
+            # The recorder paused here. End the part when its last GOP ended
+            # instead of stretching its frames across the pause; the pause is
+            # left out of the output so the untimestamped audio stays in sync.
+            segment_end = segment_end_before_gap(info, start_index, end_index)
+        else:
+            segment_end = info.keyframes[end_index].timestamp
         segment = Segment(
             number, start_index, end_index, info.keyframes[start_index].timestamp,
-            info.keyframes[end_index].timestamp if end_index < len(info.keyframes) else end,
-            end_frame - start_frame, info.keyframes[start_index].mode,
+            segment_end, end_frame - start_frame, info.keyframes[start_index].mode,
         )
         if segment.duration <= 0 or segment.frame_count <= 0 or not 0.1 <= segment.fps <= 120:
             raise RuntimeError(f"Invalid timing in timeline segment {number + 1}.")
@@ -577,14 +632,23 @@ def extract_audio(path, info, temp_dir):
 
 
 def write_concat(path, segments, use_mkv=False):
+    """Write the concat list and return seconds of dropped video before it starts."""
     with path.open("w", encoding="ascii", newline="\n") as output:
         output.write("ffconcat version 1.0\n")
         entries = []
+        leading = dropped = 0.0
         for segment in segments:
             if use_mkv and segment.fully_dropped:
-                if entries:
-                    entries[-1][1] += segment.duration
+                dropped += segment.duration
                 continue
+            # A dropped interior part extends the previous part; dropped parts
+            # before the first kept one become an input offset instead. Dropped
+            # trailing parts simply end the video early.
+            if entries:
+                entries[-1][1] += dropped
+            else:
+                leading = dropped
+            dropped = 0.0
             source = segment.raw_path.with_suffix(".mkv") if use_mkv else segment.raw_path
             entries.append([source, segment.duration])
 
@@ -600,6 +664,7 @@ def write_concat(path, segments, use_mkv=False):
                 segment = next(item for item in segments if item.raw_path == source)
                 output.write(f"option framerate {segment.fps:.12f}\n")
                 output.write(f"duration {duration:.9f}\n")
+    return leading
 
 
 def find_executable(name):
@@ -690,6 +755,8 @@ def gop_frame_count(info, key_number):
 
 def recover_segment(path, ffmpeg, ffprobe, info, segment, temp_dir):
     recovery_dir = temp_dir / f"segment_{segment.index:04d}_recovery"
+    # --keep-temp reuses a fixed work directory across runs.
+    shutil.rmtree(recovery_dir, ignore_errors=True)
     recovery_dir.mkdir()
     gops = extract_segment_gops(path, info, segment, recovery_dir)
     if not gops:
@@ -764,15 +831,25 @@ def recover_segment(path, ffmpeg, ffprobe, info, segment, temp_dir):
     return output_path
 
 
-def timestamp_segments(path, ffmpeg, ffprobe, info, segments, temp_dir):
+def timestamp_segments(
+    path, ffmpeg, ffprobe, info, segments, temp_dir, probe_counts=True,
+):
     # Raw H.26x has no packet timestamps. Remux each anchor interval first;
     # then the concat demuxer sees timestamped inputs. This is the optimistic
     # stream-copy path; decoding is performed once on the complete result.
+    # Without probe_counts (fast mode) one XMEye frame record is assumed to be
+    # one encoded packet; validate_output raises PacketCountMismatch otherwise.
     for number, segment in enumerate(segments, 1):
+        if segment.fully_dropped:
+            continue
         print(f"  Timestamping part {number}/{len(segments)}", end="\r", flush=True)
-        segment.encoded_frames, segment.encoded_keyframes = probe_encoded_frames(
-            ffprobe, segment.raw_path, info.demuxer
-        )
+        if probe_counts:
+            segment.encoded_frames, segment.encoded_keyframes = probe_encoded_frames(
+                ffprobe, segment.raw_path, info.demuxer
+            )
+        elif segment.encoded_frames is None:
+            segment.encoded_frames = segment.frame_count
+            segment.encoded_keyframes = segment.end_keyframe - segment.start_keyframe
         output_segment = segment.raw_path.with_suffix(".mkv")
         remuxed = timestamp_stream(ffmpeg, info, segment, output_segment)
         if remuxed.returncode != 0:
@@ -810,11 +887,12 @@ def recover_decoding_segments(path, ffmpeg, ffprobe, info, segments, temp_dir):
 
 
 def mux_segments(ffmpeg, info, segments, concat_path, output_path, audio_path):
-    write_concat(concat_path, segments, use_mkv=True)
-    command = [
-        ffmpeg, "-hide_banner", "-loglevel", "warning", "-y",
-        "-f", "concat", "-safe", "0", "-i", str(concat_path),
-    ]
+    leading = write_concat(concat_path, segments, use_mkv=True)
+    command = [ffmpeg, "-hide_banner", "-loglevel", "warning", "-y"]
+    if leading > 0:
+        # Keep audio aligned when the opening part was fully damaged.
+        command.extend(["-itsoffset", f"{leading:.9f}"])
+    command.extend(["-f", "concat", "-safe", "0", "-i", str(concat_path)])
     if audio_path is not None:
         if info.audio.codec == "aac":
             command.extend(["-f", "aac"])
@@ -929,7 +1007,7 @@ def validate_output(ffprobe, path, info, segments, expected_duration):
         for segment in segments
     )
     if count != expected_packets or keys != expected_keys:
-        raise RuntimeError(
+        raise PacketCountMismatch(
             f"Output packets/keyframes {count}/{keys}; expected "
             f"{expected_packets}/{expected_keys}."
         )
@@ -941,11 +1019,12 @@ def validate_output(ffprobe, path, info, segments, expected_duration):
         ),
         default=0.0,
     ) + 0.005
-    if abs(video_end - expected_duration) > max(
+    expected_video_end = expected_duration - dropped_edge_durations(segments)[1]
+    if abs(video_end - expected_video_end) > max(
         0.100, expected_duration * 0.0001, frame_tolerance
     ):
         raise RuntimeError(
-            f"Output video duration {video_end:.3f} s; expected {expected_duration:.3f} s."
+            f"Output video duration {video_end:.3f} s; expected {expected_video_end:.3f} s."
         )
     audio_end = validate_audio(ffprobe, path, info.audio) if info.audio else None
     format_duration = float(summary["format"]["duration"])
@@ -954,7 +1033,8 @@ def validate_output(ffprobe, path, info, segments, expected_duration):
 
 def print_analysis(info, segments, end, end_source):
     first = info.keyframes[0].timestamp
-    duration = (end - first).total_seconds()
+    duration = sum(segment.duration for segment in segments)
+    paused = (end - first).total_seconds() - duration
     modes = Counter(item.mode for item in info.keyframes)
     gaps = [
         (b.timestamp - a.timestamp).total_seconds()
@@ -996,6 +1076,8 @@ def print_analysis(info, segments, end, end_source):
         print(f"FC repairs:     {info.timestamp_repairs:,} locally regressed timestamp(s) interpolated")
     print(f"Recording end:  {end} ({end_source})")
     print(f"Duration:       {duration:.3f} s ({duration / 60:.2f} min)")
+    if paused > 0.001:
+        print(f"Pauses:         {paused:.3f} s of recorder pauses left out of the timeline")
     print(f"FC modes/FPS:   {dict(sorted(modes.items()))}")
     if gaps:
         print(f"Median GOP gap: {statistics.median(gaps):.3f} s")
@@ -1011,19 +1093,52 @@ def print_analysis(info, segments, end, end_source):
         )
 
 
-def convert(path, output_path, keep_temp, anchor_interval, transition_min, forced_fps):
+def verify_decoding_and_recover(
+    path, ffmpeg, ffprobe, info, segments, temp_dir, concat_path,
+    temporary_output, audio_path,
+):
+    print("\nStrict-decoding the complete fast-path result...")
+    clean, error = decode_video(ffmpeg, temporary_output)
+    if clean:
+        return
+    print("Fast-path decode failed; locating damaged timeline parts...")
+    temporary_output.unlink(missing_ok=True)
+    recover_decoding_segments(
+        path, ffmpeg, ffprobe, info, segments, temp_dir
+    )
+    mux_segments(
+        ffmpeg, info, segments, concat_path, temporary_output, audio_path
+    )
+    clean, error = decode_video(ffmpeg, temporary_output)
+    if not clean:
+        detail = error.splitlines()[0] if error else "unknown decode error"
+        raise RuntimeError(
+            f"Recovered output still fails strict decoding: {detail}"
+        )
+
+
+def convert(
+    path, output_path, keep_temp, anchor_interval, transition_min, forced_fps,
+    verify_decode=True, work_dir=None,
+):
     ffmpeg, ffprobe = find_executable("ffmpeg"), find_executable("ffprobe")
     print(f"Input:  {path}\nOutput: {output_path}\n\nInspecting XMEye stream...")
     info = inspect_stream(path)
     segments, end, end_source = build_timeline(
         path, info, anchor_interval, transition_min, forced_fps
     )
-    expected = (end - info.keyframes[0].timestamp).total_seconds()
+    expected = sum(segment.duration for segment in segments)
     check_audio_timeline(info, expected)
     print()
     print_analysis(info, segments, end, end_source)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    if keep_temp:
+    if work_dir is not None:
+        # The caller owns this directory and removes it even if it has to
+        # kill this process.
+        temp_dir = work_dir
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        context = None
+    elif keep_temp:
         temp_dir = output_path.parent / f"{output_path.stem}_work"
         temp_dir.mkdir(parents=True, exist_ok=True)
         context = None
@@ -1040,31 +1155,40 @@ def convert(path, output_path, keep_temp, anchor_interval, transition_min, force
             print("\nMuxing reconstructed video (copy) and converting A-law audio to AAC...")
         else:
             print("\nMuxing reconstructed video and audio (stream copy)...")
-        timestamp_segments(path, ffmpeg, ffprobe, info, segments, temp_dir)
+        timestamp_segments(
+            path, ffmpeg, ffprobe, info, segments, temp_dir,
+            probe_counts=verify_decode,
+        )
         mux_segments(
             ffmpeg, info, segments, concat_path, temporary_output, audio_path
         )
-        print("\nStrict-decoding the complete fast-path result...")
-        clean, error = decode_video(ffmpeg, temporary_output)
-        if not clean:
-            print("Fast-path decode failed; locating damaged timeline parts...")
-            temporary_output.unlink(missing_ok=True)
-            recover_decoding_segments(
-                path, ffmpeg, ffprobe, info, segments, temp_dir
+        if verify_decode:
+            verify_decoding_and_recover(
+                path, ffmpeg, ffprobe, info, segments, temp_dir, concat_path,
+                temporary_output, audio_path,
             )
+        else:
+            print(
+                "\nFast mode: skipping the complete video decode and automatic "
+                "GOP recovery."
+            )
+        print("\nValidating streams, durations, and packet timestamps...")
+        try:
+            duration, video_duration, audio_duration, packets, keys, _ = validate_output(
+                ffprobe, temporary_output, info, segments, expected
+            )
+        except PacketCountMismatch as exc:
+            if verify_decode:
+                raise
+            print(f"{exc}\nFast mode: re-counting encoded packets and muxing again...")
+            temporary_output.unlink(missing_ok=True)
+            timestamp_segments(path, ffmpeg, ffprobe, info, segments, temp_dir)
             mux_segments(
                 ffmpeg, info, segments, concat_path, temporary_output, audio_path
             )
-            clean, error = decode_video(ffmpeg, temporary_output)
-            if not clean:
-                detail = error.splitlines()[0] if error else "unknown decode error"
-                raise RuntimeError(
-                    f"Recovered output still fails strict decoding: {detail}"
-                )
-        print("\nValidating streams, durations, and packet timestamps...")
-        duration, video_duration, audio_duration, packets, keys, _ = validate_output(
-            ffprobe, temporary_output, info, segments, expected
-        )
+            duration, video_duration, audio_duration, packets, keys, _ = validate_output(
+                ffprobe, temporary_output, info, segments, expected
+            )
         dropped_gops = sum(segment.dropped_gops for segment in segments)
         dropped_frames = sum(segment.dropped_frames for segment in segments)
         os.replace(temporary_output, output_path)
@@ -1110,6 +1234,12 @@ def main():
                         help="Explicit constant-FPS override for diagnostics/legacy use.")
     parser.add_argument("--real-time", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--keep-temp", action="store_true")
+    parser.add_argument("--work-dir", type=Path, default=None, help=argparse.SUPPRESS)
+    parser.add_argument(
+        "--fast", action="store_true",
+        help=("Skip the full video decode and GOP recovery; packet, timestamp, "
+              "duration and audio validation still run."),
+    )
     args = parser.parse_args()
     if args.anchor_interval < MIN_SEGMENT_SECONDS:
         parser.error(f"--anchor-interval must be at least {MIN_SEGMENT_SECONDS:g} seconds.")
@@ -1127,7 +1257,8 @@ def main():
         parser.error("Output must use the .mp4 extension.")
     try:
         convert(path, output, args.keep_temp, args.anchor_interval,
-                args.transition_min_seconds, args.fps)
+                args.transition_min_seconds, args.fps, not args.fast,
+                args.work_dir.resolve() if args.work_dir else None)
     except subprocess.CalledProcessError as exc:
         print(f"\nFFmpeg/ffprobe failed with exit code {exc.returncode}.", file=sys.stderr)
         sys.exit(exc.returncode or 1)
