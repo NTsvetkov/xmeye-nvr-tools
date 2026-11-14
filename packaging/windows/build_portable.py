@@ -101,7 +101,7 @@ def main():
         ROOT / "packaging" / "windows" / "licenses", notices / "open-source",
         dirs_exist_ok=True,
     )
-    for name in ("LICENSE", "README.md", "README.bg.md"):
+    for name in ("LICENSE", "README.md", "README.bg.md", "CHANGELOG.md"):
         shutil.copy2(ROOT / name, bundle / name)
     shutil.copytree(ROOT / "docs", bundle / "docs", dirs_exist_ok=True)
     shutil.copy2(
