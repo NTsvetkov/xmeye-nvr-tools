@@ -25,6 +25,7 @@ DEFAULT_ANCHOR_INTERVAL = 60.0
 DEFAULT_TRANSITION_MIN_SECONDS = 10.0
 MAX_TRAILER_BYTES = 4096
 MAX_KEYFRAME_GAP = 30.0
+FILENAME_END_TOLERANCE_SECONDS = 1.0
 MIN_SEGMENT_SECONDS = 5.0
 
 
@@ -489,9 +490,17 @@ def build_timeline(path, info, anchor_interval, transition_min, forced_fps):
         else:
             end, source = infer_end(info), "FC timestamps (inferred final GOP)"
         final_gap = (end - info.keyframes[-1].timestamp).total_seconds()
-        if final_gap == 0:
+        if -FILENAME_END_TOLERANCE_SECONDS <= final_gap <= 0:
+            # Recorder filenames and FC timestamps have whole-second precision.
+            # A boundary up to one second before the final keyframe must not
+            # discard its GOP. Reuse the zero-gap inference for the final GOP.
+            if final_gap < 0:
+                print(
+                    f"Warning: recording filename ends {-final_gap:g} s before "
+                    "the last FC timestamp; inferring the final GOP end."
+                )
             end = infer_end(info)
-            source = "FC timestamps (inferred final GOP after zero filename gap)"
+            source = "FC timestamps (inferred final GOP within filename end tolerance)"
             final_gap = (end - info.keyframes[-1].timestamp).total_seconds()
         if end <= first or final_gap < 0:
             raise RuntimeError(
