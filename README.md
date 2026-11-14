@@ -2,6 +2,8 @@
 
 English | [Български](README.bg.md)
 
+[Changelog](CHANGELOG.md)
+
 For a Windows portable build, extract the entire ZIP and run `XMEyeNVR.exe`
 inside the `XMEyeNVR` folder. Keep `XMEyeConvert.exe`, `bin/` and `_internal/`
 beside it. The portable package includes Python, Qt, FFmpeg and ffprobe;
